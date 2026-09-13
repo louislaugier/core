@@ -1,0 +1,48 @@
+# Build the mutex-patched ASB image off the funds box and publish it to GHCR,
+# so the maker only has to `docker pull`. Triggered by pushes to the patch
+# branch (asb_autoupgrade.sh pushes the rebased branch) or by hand.
+name: build-asb-mutex
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: free runner disk (monero-sys build needs >14 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - name: read asb version
+        id: v
+        run: |
+          ver=$(grep -m1 '^version' swap/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: swap-asb/Dockerfile
+          push: true
+          tags: ghcr.io/louislaugier/eigenwallet-asb:${{ steps.v.outputs.ver }}-full1193
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
