@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Represents the rate at which we are willing to trade 1 XMR.
@@ -116,7 +117,9 @@ impl crate::traits::LatestRate for FixedRate {
 /// construction).
 #[derive(Debug, Clone)]
 pub struct ExchangeRate {
-    ask_spread: Decimal,
+    /// Shared by every clone (quote path, swap-setup path) so a spread
+    /// hot-reloaded from config.toml reaches all of them at once.
+    ask_spread: Arc<RwLock<Decimal>>,
     kraken_price_updates: Option<crate::kraken::PriceUpdates>,
     bitfinex_price_updates: Option<crate::bitfinex::PriceUpdates>,
     kucoin_price_updates: Option<crate::kucoin::PriceUpdates>,
@@ -145,13 +148,24 @@ impl ExchangeRate {
             return Err(NoPriceFeedEnabled);
         }
         Ok(Self {
-            ask_spread,
+            ask_spread: Arc::new(RwLock::new(ask_spread)),
             kraken_price_updates,
             bitfinex_price_updates,
             kucoin_price_updates,
             exolix_price_updates,
             validity_duration,
         })
+    }
+
+    pub fn ask_spread(&self) -> Decimal {
+        *self.ask_spread.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set_ask_spread(&self, ask_spread: Decimal) {
+        *self
+            .ask_spread
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ask_spread;
     }
 }
 
@@ -212,7 +226,15 @@ impl crate::traits::LatestRate for ExchangeRate {
             exolix_update,
             self.validity_duration,
         )
-        .map(|average_ask| Rate::new(average_ask, self.ask_spread))
+        .map(|average_ask| Rate::new(average_ask, self.ask_spread()))
+    }
+
+    fn current_ask_spread(&self) -> Option<Decimal> {
+        Some(self.ask_spread())
+    }
+
+    fn set_ask_spread(&mut self, ask_spread: Decimal) {
+        ExchangeRate::set_ask_spread(self, ask_spread);
     }
 }
 

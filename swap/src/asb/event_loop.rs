@@ -30,7 +30,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use swap_core::bitcoin;
 use swap_env::config::RefundPolicy;
 use swap_env::env;
@@ -39,6 +39,9 @@ use swap_p2p::protocols::cooperative_xmr_redeem_after_punish;
 use tokio::sync::{mpsc, oneshot};
 use tor_hsservice::RunningOnionService;
 use uuid::Uuid;
+
+/// How often config.toml is checked for a changed `maker.ask_spread`.
+const CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub use service::{EventLoopRequest, EventLoopService, OnionServiceStatusInfo};
 
@@ -63,6 +66,9 @@ where
     refund_policy: RefundPolicy,
 
     config_path: PathBuf,
+    /// Last seen modification time of `config_path`; a change triggers a
+    /// re-read of `maker.ask_spread` (see `reload_ask_spread_if_config_changed`).
+    config_mtime: Option<SystemTime>,
 
     /// Cache for quotes
     quote_cache: Cache<QuoteCacheKey, Result<Arc<BidQuote>, Arc<anyhow::Error>>>,
@@ -204,6 +210,9 @@ where
         let (service_sender, service_requests) = mpsc::unbounded_channel();
 
         let quote_cache = Cache::builder().time_to_live(QUOTE_CACHE_TTL).build();
+        let config_mtime = std::fs::metadata(&config_path)
+            .and_then(|meta| meta.modified())
+            .ok();
 
         let event_loop = EventLoop {
             swarm,
@@ -222,6 +231,7 @@ where
             hermes_funding_policy,
             refund_policy,
             config_path,
+            config_mtime,
             quote_cache,
             recv_encrypted_signature: Default::default(),
             recv_burn_on_refund_instruction: Default::default(),
@@ -297,8 +307,13 @@ where
             }
         }
 
+        let mut config_watch = tokio::time::interval(CONFIG_WATCH_INTERVAL);
+
         loop {
             tokio::select! {
+                _ = config_watch.tick() => {
+                    self.reload_ask_spread_if_config_changed().await;
+                }
                 swarm_event = self.swarm.select_next_some() => {
                     if let Some(metrics) = &self.metrics {
                         metrics.record(&swarm_event);
@@ -1072,6 +1087,58 @@ where
     }
 
     /// Change `maker.external_bitcoin_redeem_address` both in-memory and
+    /// Hot-reload `maker.ask_spread` when config.toml changes on disk.
+    ///
+    /// Operators retune the spread several times a day; restarting the maker
+    /// for every edit drops all libp2p connections and costs about an hour of
+    /// presence in the public registries. The spread lives behind a shared
+    /// handle in the rate source, so the quote path and the swap-setup path
+    /// both see the new value at once, and the quote cache is flushed so the
+    /// next request is priced with it. Only the spread is reloaded: min/max
+    /// buy amounts are copied into the swarm at construction and still need a
+    /// restart. A rewrite with the same spread (or by this process, see
+    /// `handle_set_external_bitcoin_redeem_address`) is a no-op.
+    async fn reload_ask_spread_if_config_changed(&mut self) {
+        let mtime = match tokio::fs::metadata(&self.config_path)
+            .await
+            .and_then(|meta| meta.modified())
+        {
+            Ok(mtime) => mtime,
+            Err(_) => return,
+        };
+        if self.config_mtime == Some(mtime) {
+            return;
+        }
+        // Operators write the file in place (a bind-mounted file follows its
+        // inode, so an atomic replace would never be seen here); a read that
+        // lands mid-write fails to parse and is simply retried next tick, so
+        // the mtime is only remembered once the file parsed.
+        let ask_spread = match swap_env::config::Config::read(&self.config_path) {
+            Ok(config) => config.maker.ask_spread,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "config.toml changed on disk but could not be parsed; will retry"
+                );
+                return;
+            }
+        };
+        self.config_mtime = Some(mtime);
+        let Some(current) = self.latest_rate.current_ask_spread() else {
+            return;
+        };
+        if current == ask_spread {
+            return;
+        }
+        self.latest_rate.set_ask_spread(ask_spread);
+        self.quote_cache.invalidate_all();
+        tracing::info!(
+            previous = %current,
+            %ask_spread,
+            "Reloaded ask_spread from config.toml without restart"
+        );
+    }
+
     /// on disk. Applies only to swaps started _afterwards_.
     ///
     /// Uses `toml_edit` so the on-disk edit is minimal: comments,
