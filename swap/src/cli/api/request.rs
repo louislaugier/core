@@ -1959,3 +1959,74 @@ impl Request for RefreshP2PArgs {
         Ok(RefreshP2PResponse {})
     }
 }
+
+// ListSellers (CLI only, 2026-09-16): discover makers at the rendezvous points the
+// context was built with and print their quotes as ONE JSON ARRAY PER LINE. With
+// `follow` the process keeps running, re-requests quotes every `refresh_secs`
+// and prints a new array whenever a quote changes — the live rival board that
+// the commission controller reacts to within seconds.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListSellersArgs {
+    pub timeout_secs: u64,
+    pub follow: bool,
+    pub refresh_secs: u64,
+    /// Makers to dial directly (peer id, multiaddr) — quotes are fetched on connect.
+    pub peers: Vec<(PeerId, Multiaddr)>,
+}
+
+impl Request for ListSellersArgs {
+    type Response = Vec<QuoteWithAddress>;
+
+    async fn request(self, ctx: Arc<Context>) -> Result<Self::Response> {
+        list_sellers(self, ctx).await
+    }
+}
+
+async fn list_sellers(args: ListSellersArgs, ctx: Arc<Context>) -> Result<Vec<QuoteWithAddress>> {
+    let mut handle = ctx.try_get_event_loop_handle().await?;
+    for (peer_id, addr) in &args.peers {
+        handle.queue_peer_address(*peer_id, addr.clone()).await?;
+    }
+    let mut rx = handle.cached_quotes();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    let mut last: Vec<QuoteWithAddress> = rx.borrow().clone();
+    // Wait for the first non-empty snapshot, or give up at the deadline.
+    while last.is_empty() {
+        if tokio::time::timeout_at(deadline, rx.changed())
+            .await
+            .is_err()
+        {
+            break;
+        }
+        last = rx.borrow().clone();
+    }
+    // Stragglers answer right after the first batch: give them a few seconds.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.changed().await.is_ok() {
+            last = rx.borrow().clone();
+        }
+    })
+    .await;
+    println!("{}", serde_json::to_string(&last)?);
+    if !args.follow {
+        return Ok(last);
+    }
+    let mut ticker = tokio::time::interval(Duration::from_secs(args.refresh_secs.max(5)));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(e) = handle.refresh().await {
+                    tracing::warn!(%e, "quote refresh failed");
+                }
+            }
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                last = rx.borrow().clone();
+                println!("{}", serde_json::to_string(&last)?);
+            }
+        }
+    }
+    Ok(last)
+}

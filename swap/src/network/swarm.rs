@@ -68,8 +68,9 @@ where
         // Limit peers stuck in the handshake phase
         .with_max_pending_incoming(Some(64 * 4))
         .with_max_established_incoming(Some(128 * 4))
-        // A single peer only needs one connection; allow 4 for brief overlap during reconnects
-        .with_max_established_per_peer(Some(4));
+        // A single peer only needs one connection; allow 12: Tor takers leave stale circuits
+        // behind and were refused at 4 (120 rejections/day seen live 2026-09-16)
+        .with_max_established_per_peer(Some(12));
 
     let (transport, onion_addresses, wormhole_channels, onion_service_handle) =
         asb::transport::new(

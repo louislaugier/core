@@ -1,7 +1,7 @@
 use crate::cli::api::Context;
 use crate::cli::api::request::{
     BalanceArgs, CancelAndRefundArgs, ExportBitcoinWalletArgs, GetConfigArgs, GetHistoryArgs,
-    MoneroRecoveryArgs, Request, ResumeSwapArgs, WithdrawBtcArgs,
+    ListSellersArgs, MoneroRecoveryArgs, Request, ResumeSwapArgs, WithdrawBtcArgs,
 };
 use anyhow::Result;
 use bitcoin::address::NetworkUnchecked;
@@ -129,6 +129,41 @@ async fn apply_defaults(
 
             BalanceArgs {
                 force_refresh: true,
+            }
+            .request(context)
+            .await?;
+        }
+        CliCommand::ListSellers {
+            bitcoin,
+            rendezvous_point,
+            peer,
+            timeout,
+            follow,
+            refresh_secs,
+            tor,
+        } => {
+            let points = rendezvous_point
+                .into_iter()
+                .map(split_rendezvous)
+                .collect::<Result<Vec<_>>>()?;
+            let peers = peer
+                .into_iter()
+                .map(|a| split_rendezvous(a).map(|(id, mut v)| (id, v.remove(0))))
+                .collect::<Result<Vec<_>>>()?;
+            ContextBuilder::new(is_testnet)
+                .with_bitcoin(bitcoin)
+                .with_data_dir(data)
+                .with_json(json)
+                .with_tor(tor)
+                .with_rendezvous_points(points)
+                .build(context.clone())
+                .await?;
+
+            ListSellersArgs {
+                timeout_secs: timeout,
+                follow,
+                refresh_secs,
+                peers,
             }
             .request(context)
             .await?;
@@ -279,6 +314,50 @@ enum CliCommand {
             parse(try_from_str = bitcoin_address::parse)
         )]
         address: bitcoin::Address<NetworkUnchecked>,
+    },
+    #[structopt(
+        about = "Discover makers at rendezvous points and print their live quotes as JSON (one array per line)."
+    )]
+    ListSellers {
+        #[structopt(flatten)]
+        bitcoin: Bitcoin,
+
+        #[structopt(
+            long = "rendezvous-point",
+            help = "Rendezvous node multiaddr ending in /p2p/<peer id>; repeatable",
+            required = true
+        )]
+        rendezvous_point: Vec<Multiaddr>,
+
+        #[structopt(
+            long = "peer",
+            help = "Maker multiaddr ending in /p2p/<peer id> to dial directly (repeatable); \
+                    public rendezvous nodes refuse DISCOVER to CLIs, the registries still list addresses"
+        )]
+        peer: Vec<Multiaddr>,
+
+        #[structopt(
+            long = "timeout",
+            default_value = "90",
+            help = "Seconds to wait for the first quotes"
+        )]
+        timeout: u64,
+
+        #[structopt(
+            long = "follow",
+            help = "Keep running and print a new array whenever a quote changes"
+        )]
+        follow: bool,
+
+        #[structopt(
+            long = "refresh-secs",
+            default_value = "15",
+            help = "With --follow: re-request quotes this often"
+        )]
+        refresh_secs: u64,
+
+        #[structopt(long = "tor", help = "Dial through Tor (needed for onion makers)")]
+        tor: bool,
     },
     #[structopt(about = "Prints the Bitcoin balance.")]
     Balance {
@@ -552,5 +631,13 @@ mod tests {
             tor: Default::default(),
         };
         simple_positive(&raw_ars, (true, true, None), cli_cmd).await;
+    }
+}
+
+/// A rendezvous multiaddr `.../p2p/<peer id>` split the way ContextBuilder wants it.
+fn split_rendezvous(mut addr: Multiaddr) -> Result<(libp2p::PeerId, Vec<Multiaddr>)> {
+    match addr.pop() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Ok((peer_id, vec![addr])),
+        _ => anyhow::bail!("rendezvous point must end in /p2p/<peer id>: {addr}"),
     }
 }
