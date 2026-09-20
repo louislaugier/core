@@ -23,13 +23,15 @@ use tokio::select;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Serializes the Monero lock phase (output selection in `BtcLocked` through the first
-/// relay in `XmrLockTransactionConstructed`) across all swaps in the process. wallet2 only
-/// marks an output spent once its lock transaction is relayed and monero-sys has no reserve
-/// API, so without this two overlapping swaps pick the same output and the loser's lock
-/// transaction is a permanent double-spend that monerod rejects forever. Each swap tracks
-/// its participation through a session held on `run_until`'s stack because construct and
-/// publish are separate states.
+/// Serializes the Monero lock phase (output selection in `BtcLocked` through the lock
+/// transaction's first confirmation in `XmrLockTransactionSent`) across all swaps in the
+/// process. wallet2 does not mark an output spent when the lock is merely relayed, and
+/// monero-sys has no reserve API, so without this two overlapping swaps pick the same
+/// output and the loser's lock is a permanent double-spend that monerod rejects forever.
+/// Measured on mainnet 20/09/2026: releasing at relay left a 5 min 17 s window and cost a
+/// swap (relay 13:55:39, next construction 13:55:52, confirmation only at 14:00:56). Each
+/// swap tracks its participation through a session held on `run_until`'s stack because
+/// construct, publish and confirm are separate states.
 static MONERO_LOCK_PHASE: LazyLock<MoneroLockPhase> =
     LazyLock::new(|| MoneroLockPhase::new(MONERO_LOCK_PHASE_MAX_HOLD));
 
@@ -1367,25 +1369,33 @@ async fn cancel_timelock_not_expired(
 }
 
 /// Whether `state` is inside the serialized Monero lock phase (see [`MONERO_LOCK_PHASE`]).
+/// `XmrLockTransactionSent` is inside it: the phase ends at the lock's first confirmation
+/// (`XmrLocked`), which is when wallet2 reliably reports the outputs as spent.
 fn in_monero_lock_phase(state: &AliceState) -> bool {
     matches!(
         state,
-        AliceState::BtcLocked { .. } | AliceState::XmrLockTransactionConstructed { .. }
+        AliceState::BtcLocked { .. }
+            | AliceState::XmrLockTransactionConstructed { .. }
+            | AliceState::XmrLockTransactionSent { .. }
     )
 }
 
 /// Releases [`MONERO_LOCK_PHASE`] after a swap overstays its deadline while still holding a
-/// constructed lock transaction. If that transaction already reached the chain, scan it so
+/// constructed or relayed lock transaction. If that transaction already reached the chain, scan it so
 /// wallet2 marks its outputs spent before the next swap constructs; otherwise the
 /// unserialized race returns for this one wedged swap. Bounded so an unresponsive daemon
 /// cannot extend the hold.
 async fn abandon_lock_phase(state: &AliceState, monero_wallet: &monero::Wallets) {
-    let AliceState::XmrLockTransactionConstructed { xmr_lock_tx, .. } = state else {
-        tracing::warn!("Monero lock phase exceeded its deadline; releasing the lock");
-        return;
+    let tx_hash = match state {
+        AliceState::XmrLockTransactionConstructed { xmr_lock_tx, .. } => {
+            monero::TxHash::from_tx(xmr_lock_tx)
+        }
+        AliceState::XmrLockTransactionSent { transfer_proof, .. } => transfer_proof.tx_hash(),
+        _ => {
+            tracing::warn!("Monero lock phase exceeded its deadline; releasing the lock");
+            return;
+        }
     };
-
-    let tx_hash = monero::TxHash::from_tx(xmr_lock_tx);
     tracing::warn!(%tx_hash, "Monero lock phase exceeded its deadline; releasing the lock");
 
     let scanned = timeout(Duration::from_secs(60), async {
