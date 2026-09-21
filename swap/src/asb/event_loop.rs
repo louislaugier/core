@@ -106,8 +106,10 @@ where
         FuturesUnordered<BoxFuture<'static, Result<Arc<BidQuote>, Arc<anyhow::Error>>>>,
 
     /// Response channels waiting for the in-flight quote computation to finish.
-    /// Drained once the computation resolves.
-    pending_quote_channels: HashMap<PeerId, ResponseChannel<BidQuote>>,
+    /// Drained once the computation resolves. A Vec per peer, not one channel: keyed by
+    /// PeerId alone, a taker that asked twice while the computation ran had its first
+    /// channel overwritten and never got an answer (ResponseOmission, mainnet 21/09/2026).
+    pending_quote_channels: HashMap<PeerId, Vec<ResponseChannel<BidQuote>>>,
 
     /// Controller RPC responders waiting for the in-flight quote computation.
     /// Drained alongside `pending_quote_channels` when the computation resolves.
@@ -347,11 +349,15 @@ where
                         }
                         SwarmEvent::Behaviour(OutEvent::QuoteRequested { channel, peer }) => {
                             if let Some(quote) = self.fresh_quote() {
+                                // Per-peer, because the aggregate count cannot tell a taker
+                                // asking once from a crawler polling every 20 s, and that is
+                                // the number the desk needs to read demand.
+                                tracing::debug!(%peer, price = %quote.price, "Served quote from cache");
                                 if self.swarm.behaviour_mut().quote.send_response(channel, quote).is_err() {
                                     tracing::debug!(%peer, "Failed to respond with quote");
                                 }
                             } else {
-                                self.pending_quote_channels.insert(peer, channel);
+                                self.pending_quote_channels.entry(peer).or_default().push(channel);
                                 self.ensure_quote_computation_is_inflight();
                             }
                         }
@@ -568,11 +574,15 @@ where
                         Err(_) => BidQuote::ZERO,
                     };
 
-                    tracing::trace!(?quote, num_requests = self.pending_quote_channels.len(), "Responding with quote to requests");
+                    let num_requests: usize = self.pending_quote_channels.values().map(Vec::len).sum();
+                    tracing::trace!(?quote, num_requests, "Responding with quote to requests");
 
-                    for (peer, channel) in self.pending_quote_channels.drain() {
-                        if self.swarm.behaviour_mut().quote.send_response(channel, quote.clone()).is_err() {
-                            tracing::debug!(%peer, "Failed to respond with quote");
+                    for (peer, channels) in self.pending_quote_channels.drain() {
+                        for channel in channels {
+                            tracing::debug!(%peer, price = %quote.price, "Served computed quote");
+                            if self.swarm.behaviour_mut().quote.send_response(channel, quote.clone()).is_err() {
+                                tracing::debug!(%peer, "Failed to respond with quote");
+                            }
                         }
                     }
 
