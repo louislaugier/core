@@ -1,6 +1,7 @@
 use crate::cli::api::Context;
 use crate::cli::api::request::{
-    BalanceArgs, CancelAndRefundArgs, ExportBitcoinWalletArgs, GetConfigArgs, GetHistoryArgs,
+    BalanceArgs, BuyXmrArgs, CancelAndRefundArgs, ExportBitcoinWalletArgs, GetConfigArgs,
+    GetHistoryArgs,
     ListSellersArgs, MoneroRecoveryArgs, Request, ResumeSwapArgs, WithdrawBtcArgs,
 };
 use anyhow::Result;
@@ -129,6 +130,35 @@ async fn apply_defaults(
 
             BalanceArgs {
                 force_refresh: true,
+            }
+            .request(context)
+            .await?;
+        }
+        CliCommand::BuyXmr {
+            receive_address,
+            change_address,
+            rendezvous_point,
+            bitcoin,
+            monero,
+            tor,
+        } => {
+            let points = rendezvous_point
+                .into_iter()
+                .map(split_rendezvous)
+                .collect::<Result<Vec<_>>>()?;
+            ContextBuilder::new(is_testnet)
+                .with_tor(tor.enable_tor)
+                .with_bitcoin(bitcoin)
+                .with_monero(monero)
+                .with_rendezvous_points(points)
+                .with_data_dir(data)
+                .with_json(json)
+                .build(context.clone())
+                .await?;
+
+            BuyXmrArgs {
+                bitcoin_change_address: change_address,
+                monero_receive_pool: crate::monero::MoneroAddressPool::from(receive_address),
             }
             .request(context)
             .await?;
@@ -314,6 +344,40 @@ enum CliCommand {
             parse(try_from_str = bitcoin_address::parse)
         )]
         address: bitcoin::Address<NetworkUnchecked>,
+    },
+    /// Start a BTC for XMR swap: wait for a deposit in the internal wallet, then swap it with a
+    /// maker discovered at the rendezvous points. Upstream dropped this subcommand from the CLI
+    /// (the GUI calls the same request); the btc-xmr.com webapp taker needs it (23/09/2026).
+    BuyXmr {
+        #[structopt(
+            long = "receive-address",
+            help = "The Monero address to receive XMR",
+            parse(try_from_str = parse_monero_address)
+        )]
+        receive_address: monero_address::MoneroAddress,
+
+        #[structopt(
+            long = "change-address",
+            help = "Optional Bitcoin change address",
+            parse(try_from_str = bitcoin_address::parse)
+        )]
+        change_address: Option<bitcoin::Address<NetworkUnchecked>>,
+
+        #[structopt(
+            long = "rendezvous-point",
+            help = "Rendezvous node multiaddr ending in /p2p/<peer id>; repeatable",
+            required = true
+        )]
+        rendezvous_point: Vec<Multiaddr>,
+
+        #[structopt(flatten)]
+        bitcoin: Bitcoin,
+
+        #[structopt(flatten)]
+        monero: Monero,
+
+        #[structopt(flatten)]
+        tor: Tor,
     },
     #[structopt(
         about = "Discover makers at rendezvous points and print their live quotes as JSON (one array per line)."
@@ -621,6 +685,12 @@ mod tests {
         };
         simple_positive(&raw_ars, (true, true, None), cli_cmd).await;
     }
+}
+
+/// `--receive-address`: parsed on any network here; buy_xmr checks it against the config.
+fn parse_monero_address(s: &str) -> Result<monero_address::MoneroAddress> {
+    monero_address::MoneroAddress::from_str_with_unchecked_network(s)
+        .map_err(|e| anyhow::anyhow!("Invalid Monero address: {}", e))
 }
 
 /// A rendezvous multiaddr `.../p2p/<peer id>` split the way ContextBuilder wants it.

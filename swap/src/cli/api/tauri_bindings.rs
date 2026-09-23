@@ -794,7 +794,9 @@ impl TauriEmitter for Option<TauriHandle> {
     ) -> Result<bool> {
         match self {
             Some(tauri) => tauri.request_maker_selection(details, timeout_secs).await,
-            None => bail!("No Tauri handle available"),
+            // Headless CLI (buy-xmr): take the first quote that fits the deposit -- the caller
+            // controls which makers are discoverable through its rendezvous points.
+            None => Ok(true),
         }
     }
 
