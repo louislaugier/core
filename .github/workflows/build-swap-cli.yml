@@ -1,0 +1,46 @@
+# Build the `swap` CLI (with our buy-xmr subcommand) and attach it to a fork release, so the
+# btc-xmr.com webapp taker can `curl` it. Pushes to ci/cli-** trigger it (23/09/2026).
+name: build-swap-cli
+on:
+  push:
+    branches:
+      - 'ci/cli-**'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: free runner disk (monero-sys build needs >14 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+      - name: build swap (release)
+        run: cargo build --bin swap --release
+      - name: smoke test + package
+        run: |
+          set -euo pipefail
+          B=target/release/swap
+          $B --version
+          $B buy-xmr --help
+          ldd $B | grep -E "gtk|webkit" || echo "no gtk/webkit linked"
+          ver=$(grep -m1 '^version' swap/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          suffix=$(printf '%s' "$GITHUB_REF_NAME" | tr '/' '-')
+          tar -C target/release -cf "swap-cli-${ver}-${suffix}.tar" swap
+          sha256sum "swap-cli-${ver}-${suffix}.tar"
+          echo "TAG=cli-${ver}-${suffix}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          prerelease: true
+          files: swap-cli-*.tar
