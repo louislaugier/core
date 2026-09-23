@@ -59,12 +59,16 @@ impl libp2p::swarm::NetworkBehaviour for Behaviour {
 
     fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
         match event {
-            libp2p::swarm::FromSwarm::NewListenAddr(new_listen_addr)
-                if new_listen_addr.addr.is_local() =>
-            {
+            // Every listen address is withheld from Identify, not only the local ones:
+            // with the public listeners in Info.listen_addrs, a crawler caches and dials
+            // the raw tcp form (/ip4/<ip>/tcp/9941) and the public registries publish it
+            // instead of the configured wss/onion (observed 22-23/09/2026 on both
+            // api.eigenwallet.org and api.unstoppableswap.net). Identify still reports the
+            // configured external addresses, which is all a peer should ever dial.
+            libp2p::swarm::FromSwarm::NewListenAddr(new_listen_addr) => {
                 tracing::trace!(
                     ?new_listen_addr,
-                    "Blocking attempt by Swarm to tell Identify to share local address with other peers (FromSwarm::NewListenAddr)"
+                    "Blocking attempt by Swarm to tell Identify to share a listen address with other peers (FromSwarm::NewListenAddr)"
                 );
             }
             libp2p::swarm::FromSwarm::NewExternalAddrCandidate(new_external_addr_candidate)
