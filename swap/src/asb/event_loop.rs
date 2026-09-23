@@ -1831,6 +1831,14 @@ mod quote {
                 ))
             })?;
 
+        // Publish 1 % under what the wallet can lock right now: the swap-setup check re-derives
+        // the balance at the price and reservations of THAT moment, so a taker who clicked
+        // "max" was refused whenever the ask had moved or another swap had reserved XMR in
+        // between (every max-size setup in the 21-23/09/2026 logs). A published max that is
+        // always honourable beats one that is 1 % larger and sometimes a dead click.
+        let max_bitcoin_for_monero =
+            bitcoin::Amount::from_sat(max_bitcoin_for_monero.to_sat() / 100 * 99);
+
         let end_time = Instant::now();
         tracing::info!(%ask_price, %unreserved_xmr_balance, %max_bitcoin_for_monero, duration_ms=%end_time.duration_since(start_time).as_millis(), "Computed quote");
 
