@@ -189,6 +189,8 @@ jobs:
           - package: swap
             test_name: concurrent_bobs_after_xmr_lock_proof_sent
           - package: swap
+            test_name: concurrent_bobs_insufficient_xmr
+          - package: swap
             test_name: alice_cancels_while_waiting_for_xmr_construction_turn
           - package: swap
             test_name: alice_waits_for_xmr_construction_cooldown

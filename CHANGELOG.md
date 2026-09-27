@@ -12,8 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from output selection (`XmrReadyToLock`) to the lock's first confirmation.
     wallet2 does not count a relayed lock's inputs as spent,
     and the 4.15.0 construction cooldown only spaces constructions out.
+    A swap holds the phase for at most 20 minutes at a time:
+    past that it queues again if it has not built its lock yet,
+    and continues on its own only once the lock is built.
+    Building the lock is capped at 10 minutes and the scan after a failed build at 5,
+    so a failing build still ends inside one hold.
   - ASB: A swap the wallet can no longer fund refunds the Bitcoin early before building a lock,
     instead of retrying the construction for 30 minutes.
+    The check reads the main account's unlocked balance, the only account the lock spends from.
   - ASB: `maker.ask_spread` is reloaded from config.toml without a restart.
   - ASB: Up to 12 connections per peer (4 upstream),
     and every pending quote request is answered.

@@ -692,6 +692,15 @@ impl WalletHandle {
             .context("Couldn't complete wallet call")
     }
 
+    /// Get the unlocked balance of the main account (index 0) only: what a transaction built
+    /// by this wallet can spend, since bridge.h builds every transaction from account 0.
+    /// [`Self::unlocked_balance`] sums every account.
+    pub async fn main_account_unlocked_balance(&self) -> anyhow::Result<monero_oxide_ext::Amount> {
+        self.call(move |wallet| wallet.main_account_unlocked_balance())
+            .await
+            .context("Couldn't complete wallet call")
+    }
+
     /// Get the total balance of the wallet (unlocked + locked).
     pub async fn total_balance(&self) -> anyhow::Result<monero_oxide_ext::Amount> {
         self.call(move |wallet| wallet.total_balance())
@@ -2309,6 +2318,25 @@ impl FfiWallet {
             .unlockedBalanceAll()
             .context("Failed to get unlocked balance: FFI call failed with exception")
             .expect("Getting the unlocked balance is a simple lookup and shouldn't fail");
+        monero_oxide_ext::Amount::from_pico(balance)
+    }
+
+    /// Get the unlocked balance of the main account (index 0) in atomic units: the sum of its
+    /// subaddresses' non-strict unlocked balances, which is what wallet2 returns for
+    /// `unlockedBalance(0)` (an output counts as spent as soon as the wallet marks it spent).
+    fn main_account_unlocked_balance(&mut self) -> monero_oxide_ext::Amount {
+        let amounts = ffi::walletUnlockedBalancePerSubaddrAmounts(
+            self.inner.pinned(),
+            Self::MAIN_ACCOUNT_INDEX,
+            false,
+        );
+
+        let balance = amounts.as_ref().map_or(0, |amounts| {
+            amounts
+                .iter()
+                .fold(0u64, |total, amount| total.saturating_add(*amount))
+        });
+
         monero_oxide_ext::Amount::from_pico(balance)
     }
 
