@@ -24,10 +24,10 @@ jobs:
           host: ubuntu-22.04
 
       - name: Run clippy with default features
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: bash .github/scripts/annotate.sh cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run clippy with all features enabled
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: bash .github/scripts/annotate.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   gui_eslint:
     runs-on: ubuntu-22.04
@@ -129,16 +129,16 @@ jobs:
 
       - name: Run monero-harness tests
         if: matrix.os == 'ubuntu-22.04'
-        run: cargo test --package monero-harness --all-features
+        run: bash .github/scripts/annotate.sh cargo test --package monero-harness --all-features
 
       - name: Run library tests
-        run: cargo test  --lib
+        run: bash .github/scripts/annotate.sh cargo test --lib
 
       - name: Run Monero conflict tests
-        run: cargo test --package monero-tests --test double_spend
+        run: bash .github/scripts/annotate.sh cargo test --package monero-tests --test double_spend
 
       - name: Run Monero construction throttle tests
-        run: cargo test --manifest-path monero-wallet/Cargo.toml --test construction_throttle
+        run: bash .github/scripts/annotate.sh cargo test --manifest-path monero-wallet/Cargo.toml --test construction_throttle
 
   docker_tests:
     strategy:
@@ -261,7 +261,7 @@ jobs:
           host: ubuntu-22.04
 
       - name: Run test ${{ matrix.test_name }}
-        run: cargo test --package ${{ matrix.package }} --test ${{ matrix.test_name }} -- --nocapture
+        run: bash .github/scripts/annotate.sh cargo test --package ${{ matrix.package }} --test ${{ matrix.test_name }} -- --nocapture
 
   check_stable:
     runs-on: ubuntu-22.04
