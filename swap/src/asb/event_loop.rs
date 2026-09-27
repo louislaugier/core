@@ -1761,6 +1761,11 @@ mod quote {
         pub max_buy: bitcoin::Amount,
     }
 
+    /// The published max: 1 % under what the wallet can lock right now (see make_quote).
+    pub fn with_lock_headroom(max: bitcoin::Amount) -> bitcoin::Amount {
+        bitcoin::Amount::from_sat(max.to_sat() / 100 * 99)
+    }
+
     /// Computes a quote given the provided dependencies
     #[allow(clippy::too_many_arguments)]
     pub async fn make_quote<LR, F, Fut, I, Fut2, T, P, Fut3>(
@@ -1836,8 +1841,7 @@ mod quote {
         // "max" was refused whenever the ask had moved or another swap had reserved XMR in
         // between (every max-size setup in the 21-23/09/2026 logs). A published max that is
         // always honourable beats one that is 1 % larger and sometimes a dead click.
-        let max_bitcoin_for_monero =
-            bitcoin::Amount::from_sat(max_bitcoin_for_monero.to_sat() / 100 * 99);
+        let max_bitcoin_for_monero = with_lock_headroom(max_bitcoin_for_monero);
 
         let end_time = Instant::now();
         tracing::info!(%ask_price, %unreserved_xmr_balance, %max_bitcoin_for_monero, duration_ms=%end_time.duration_since(start_time).as_millis(), "Computed quote");
@@ -2038,7 +2042,7 @@ mod tests {
     use swap_feed::FixedRate;
 
     use crate::{
-        asb::event_loop::quote::{make_quote, unreserved_monero_balance},
+        asb::event_loop::quote::{make_quote, unreserved_monero_balance, with_lock_headroom},
         protocol::alice::ReservesMonero,
     };
 
@@ -2246,10 +2250,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Calculate the actual max bitcoin for the given balance and rate
-        let expected_max = balance
-            .max_bitcoin_for_price(rate.value().ask().unwrap())
-            .unwrap();
+        // Calculate the actual max bitcoin for the given balance and rate, less the 1 % headroom
+        let expected_max = with_lock_headroom(
+            balance
+                .max_bitcoin_for_price(rate.value().ask().unwrap())
+                .unwrap(),
+        );
         assert_eq!(result.min_quantity, min_buy);
         assert_eq!(result.max_quantity, expected_max);
     }
@@ -2361,9 +2367,11 @@ mod tests {
 
         // Compute expected max: effective balance is reduced by the tip multiplier
         let unreserved = unreserved_monero_balance(balance, std::iter::empty(), developer_tip);
-        let expected_max = unreserved
-            .max_bitcoin_for_price(rate.value().ask().unwrap())
-            .unwrap();
+        let expected_max = with_lock_headroom(
+            unreserved
+                .max_bitcoin_for_price(rate.value().ask().unwrap())
+                .unwrap(),
+        );
 
         assert_eq!(result.min_quantity, min_buy);
         assert_eq!(result.max_quantity, expected_max);
