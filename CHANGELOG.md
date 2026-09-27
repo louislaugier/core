@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fork: what louislaugier/core carries on top of 4.15.0 (branch `ci/hot8-4150`):
+  - ASB: Only one swap at a time is in the Monero lock phase,
+    from output selection (`XmrReadyToLock`) to the lock's first confirmation.
+    wallet2 does not count a relayed lock's inputs as spent,
+    and the 4.15.0 construction cooldown only spaces constructions out.
+  - ASB: A swap the wallet can no longer fund refunds the Bitcoin early before building a lock,
+    instead of retrying the construction for 30 minutes.
+  - ASB: `maker.ask_spread` is reloaded from config.toml without a restart.
+  - ASB: Up to 12 connections per peer (4 upstream),
+    and every pending quote request is answered.
+  - ASB: Identify never shares listen addresses, only the configured external addresses.
+  - ASB: The published quote max is 1 % under the balance the wallet can lock.
+  - CLI: New `list-sellers` subcommand.
+  - CI: `build-asb-mutex` builds the ASB image on GHCR for `ci/**` branches.
+
 ## [4.15.0] - 2026-09-22
 
 - GUI: Support outbound connections to makers through libp2p circuit relays.
