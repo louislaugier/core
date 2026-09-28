@@ -27,10 +27,10 @@ async fn given_alice_and_bob_manually_refund_after_funds_locked_both_refund() {
         assert!(matches!(bob_state, BobState::BtcLocked { .. }));
 
         let alice_state = alice_swap.await??;
-        assert!(matches!(
-            alice_state,
-            AliceState::XmrLockTransactionSent { .. }
-        ));
+        assert!(
+            matches!(alice_state, AliceState::XmrLockTransactionSent { .. }),
+            "alice ended in {alice_state} instead of XmrLockTransactionSent"
+        );
 
         let (bob_swap, bob_join_handle) = ctx
             .stop_and_resume_bob_from_db(bob_join_handle, bob_swap_id)

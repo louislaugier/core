@@ -1,0 +1,30 @@
+name: flaky-lock
+
+# fork only (28/09/2026): repeat the lock-path docker tests to measure how often each fails
+on:
+  push:
+    branches:
+      - "ci/hot8-4150-flaky"
+
+jobs:
+  repeat:
+    strategy:
+      fail-fast: false
+      matrix:
+        test_name:
+          - alice_and_bob_refund_using_cancel_and_refund_command
+          - concurrent_bobs_insufficient_xmr
+          - concurrent_bobs_before_xmr_lock_proof_sent
+          - happy_path
+        rep: [1, 2, 3]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+
+      - name: Run ${{ matrix.test_name }} (rep ${{ matrix.rep }})
+        run: bash .github/scripts/annotate.sh timeout -s INT -k 120 3600 cargo test --package swap --test ${{ matrix.test_name }} -- --nocapture
