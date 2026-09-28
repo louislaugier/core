@@ -132,7 +132,9 @@ jobs:
         run: bash .github/scripts/annotate.sh cargo test --package monero-harness --all-features
 
       - name: Run library tests
-        run: bash .github/scripts/annotate.sh cargo test --lib
+        # fork only: --no-fail-fast so a failing crate (swap-core's stub-wallet tests, failing
+        # upstream too) does not hide the swap crate's asb quote tests
+        run: bash .github/scripts/annotate.sh cargo test --lib --no-fail-fast
 
       - name: Run Monero conflict tests
         run: bash .github/scripts/annotate.sh cargo test --package monero-tests --test double_spend
