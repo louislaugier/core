@@ -8,6 +8,10 @@ export CARGO_TERM_COLOR=never
 log=$(mktemp)
 "$@" 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then  # timeout(1) INT, then KILL: where it hung
+  sed 's/\x1b\[[0-9;]*m//g' "$log" | tail -60 | sed -e 's/%/%25/g' -e 's/\r//g' > "$log.tail"
+  printf '::error title=TIMEOUT %s::%s\n' "$*" "$(awk '{printf "%s%%0A", $0}' "$log.tail")"
+fi
 if [ "$rc" -ne 0 ]; then
   sed 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
   {

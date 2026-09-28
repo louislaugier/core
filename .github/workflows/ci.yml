@@ -263,7 +263,9 @@ jobs:
           host: ubuntu-22.04
 
       - name: Run test ${{ matrix.test_name }}
-        run: bash .github/scripts/annotate.sh cargo test --package ${{ matrix.package }} --test ${{ matrix.test_name }} -- --nocapture
+        # fork only: 2 h cap (build ~25 min included) and the tail of a hang published, instead of
+        # GitHub's silent 6 h cancel (4 swap tests hung on 28/09/2026)
+        run: bash .github/scripts/annotate.sh timeout -s INT -k 120 7200 cargo test --package ${{ matrix.package }} --test ${{ matrix.test_name }} -- --nocapture
 
   check_stable:
     runs-on: ubuntu-22.04
