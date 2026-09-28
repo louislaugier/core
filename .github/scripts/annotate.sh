@@ -17,6 +17,7 @@ if [ "$rc" -ne 0 ]; then
   {
     grep -E '^\s+Running |^test result: FAILED|^failures:$|^    [A-Za-z0-9_:]+$' "$log.plain" \
       | grep -B1 -A12 -E 'test result: FAILED|^failures:$' | grep -v '^--$'
+    grep -E -A14 "panicked at" "$log.plain"  # why a test failed, before the build noise
     grep -E -A6 '^(error|warning)(\[[A-Za-z0-9]+\])?:|could not compile' "$log.plain"
   } | awk '!seen[$0]++' | head -240 | sed -e 's/%/%25/g' -e 's/\r//g' > "$log.err"
   split -l 40 "$log.err" "$log.part."
