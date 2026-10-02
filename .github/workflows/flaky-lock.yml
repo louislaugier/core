@@ -19,8 +19,22 @@ jobs:
         with:
           host: ubuntu-22.04
 
-      - name: Clippy on swap, swap-feed, swap-p2p, swap-asb, monero-sys (no deps)
-        run: bash .github/scripts/annotate.sh cargo clippy -p swap -p swap-feed -p swap-p2p -p swap-asb -p monero-sys --all-targets --no-deps -- -D warnings
+      - name: Clippy on swap, swap-feed, swap-p2p, swap-asb, monero-sys (no deps, keep going)
+        # 02/10: one upstream lint in swap-feed/src/kucoin.rs stopped the build before our crates;
+        # --keep-going lints every crate, and the short format keeps one line per diagnostic
+        run: |
+          set -o pipefail
+          cargo clippy -p swap -p swap-feed -p swap-p2p -p swap-asb -p monero-sys --all-targets \
+            --no-deps --keep-going --message-format=short -- -D warnings 2>&1 | tee clippy.log || true
+          grep -E '^(swap|swap-feed|swap-p2p|swap-asb|monero-sys)/[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.log \
+            | sort -u > ours.txt || true
+          echo "Rust diagnostics: $(wc -l < ours.txt)"
+          if [ -s ours.txt ]; then
+            for f in $(seq 1 40 $(wc -l < ours.txt)); do
+              printf '::error title=clippy (%s)::%s\n' "$f" "$(sed -n "${f},$((f+39))p" ours.txt | awk '{printf "%s%%0A", $0}')"
+            done
+            exit 1
+          fi
 
   repeat:
     strategy:
