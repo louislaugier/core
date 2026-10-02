@@ -23,18 +23,21 @@ jobs:
         # 02/10: one upstream lint in swap-feed/src/kucoin.rs stopped the build before our crates;
         # --keep-going lints every crate, and the short format keeps one line per diagnostic
         run: |
-          set -o pipefail
+          set +e
           cargo clippy -p swap -p swap-feed -p swap-p2p -p swap-asb -p monero-sys --all-targets \
-            --no-deps --keep-going --message-format=short -- -D warnings 2>&1 | tee clippy.log || true
-          grep -E '^(swap|swap-feed|swap-p2p|swap-asb|monero-sys)/[^ ]+:[0-9]+:[0-9]+: (error|warning)' clippy.log \
-            | sort -u > ours.txt || true
-          echo "Rust diagnostics: $(wc -l < ours.txt)"
-          if [ -s ours.txt ]; then
-            for f in $(seq 1 40 $(wc -l < ours.txt)); do
-              printf '::error title=clippy (%s)::%s\n' "$f" "$(sed -n "${f},$((f+39))p" ours.txt | awk '{printf "%s%%0A", $0}')"
-            done
-            exit 1
-          fi
+            --no-deps --keep-going --message-format=short -- -D warnings > clippy.log 2>&1
+          rc=$?
+          sed 's/\x1b\[[0-9;]*m//g' clippy.log | grep -E '(error|warning)(\[[A-Za-z0-9]+\])?: ' \
+            | grep -v 'monero-sys@' | sort -u > diag.txt
+          n=$(wc -l < diag.txt)
+          # always publish what clippy did: a green job must prove it linted (02/10/2026)
+          tail_=$(sed 's/\x1b\[[0-9;]*m//g' clippy.log | grep -v 'monero-sys@' | tail -25 | cut -c1-250)
+          printf '::notice title=clippy rc=%s diagnostics=%s::%s\n' "$rc" "$n" \
+            "$(printf '%s\n' "$tail_" | awk '{printf "%s%%0A", $0}')"
+          for f in $(seq 1 40 "$n"); do
+            printf '::error title=clippy (%s)::%s\n' "$f" "$(sed -n "${f},$((f+39))p" diag.txt | awk '{printf "%s%%0A", $0}')"
+          done
+          exit "$rc"
 
   repeat:
     strategy:
