@@ -35,8 +35,15 @@ jobs:
           tail_=$(sed 's/\x1b\[[0-9;]*m//g' clippy.log | grep -v 'monero-sys@' | tail -25 | cut -c1-250)
           printf '::notice title=clippy rc=%s diagnostics=%s::%s\n' "$rc" "$n" \
             "$(printf '%s\n' "$tail_" | awk '{printf "%s%%0A", $0}')"
-          for f in $(seq 1 40 "$n"); do
-            printf '::warning title=clippy (%s)::%s\n' "$f" "$(sed -n "${f},$((f+39))p" diag.txt | awk '{printf "%s%%0A", $0}')"
+          # the fork's own .rs files first (git diff 4.15.0..ci/hot8-4150): GitHub keeps only
+          # 10 warning annotations per step, so these must never be crowded out
+          OURS='^(monero-sys/src/lib.rs|swap-feed/src/(rate|traits).rs|swap-p2p/src/patches/identify.rs|swap/src/(asb/event_loop|cli/api/request|cli/command|network/swarm|protocol/alice|protocol/alice/lock_phase|protocol/alice/swap).rs|swap/tests/(alice_empty_balance_after_started_btc_early_refund|concurrent_bobs_insufficient_xmr|harness/mod).rs):'
+          grep -E "$OURS" diag.txt > ours.txt
+          grep -vE "$OURS" diag.txt > theirs.txt
+          printf '::error title=clippy OURS (%s lines)::%s\n' "$(wc -l < ours.txt)" \
+            "$(head -60 ours.txt | awk '{printf "%s%%0A", $0}')"
+          for f in $(seq 1 40 "$(wc -l < theirs.txt)"); do
+            printf '::warning title=clippy (%s)::%s\n' "$f" "$(sed -n "${f},$((f+39))p" theirs.txt | awk '{printf "%s%%0A", $0}')"
           done
           exit "$rc"
 
