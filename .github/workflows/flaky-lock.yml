@@ -26,7 +26,7 @@ jobs:
         run: |
           set +e
           cargo clippy -p swap -p swap-feed -p swap-p2p -p swap-asb -p monero-sys --all-targets \
-            --no-deps --keep-going --message-format=short > clippy.log 2>&1
+            --no-deps --keep-going --message-format=short -- --cap-lints warn > clippy.log 2>&1
           rc=$?
           sed 's/\x1b\[[0-9;]*m//g' clippy.log | grep -E '(error|warning)(\[[A-Za-z0-9]+\])?: ' \
             | grep -v 'monero-sys@' | sort -u > diag.txt
