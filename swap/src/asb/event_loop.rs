@@ -327,13 +327,18 @@ where
                             let monero_wallet = self.monero_wallet.clone();
                             let external_redeem_address = self.external_redeem_address.clone();
                             let btc_redeem_fee_multiplier = self.btc_redeem_fee_multiplier;
+                            let db = self.db.clone();
 
                             self.inflight_wallet_snapshots.push(async move {
                                 // Wait for the swap setup handler to request the wallet snapshot
                                 let (btc, responder) = send_wallet_snapshot.recv().await?;
 
+                                // Monero the swaps in flight already count on must not back this
+                                // setup too (fork, 05/10/2026): see `reserved_monero_in_flight`.
+                                let reserved = reserved_monero_in_flight(&db).await?;
+
                                 // Compute the wallet snapshot
-                                let wallet_snapshot = capture_wallet_snapshot(bitcoin_wallet, &monero_wallet, &external_redeem_address, btc_redeem_fee_multiplier, btc).await?;
+                                let wallet_snapshot = capture_wallet_snapshot(bitcoin_wallet, &monero_wallet, &external_redeem_address, btc_redeem_fee_multiplier, btc, reserved).await?;
 
                                 // This is used further down to then actually respond to the swap setup handler
                                 Ok((btc, responder, wallet_snapshot))
@@ -1445,12 +1450,39 @@ fn scale_fee(fee: bitcoin::Amount, multiplier: Decimal) -> Result<bitcoin::Amoun
     Ok(bitcoin::Amount::from_sat(sats))
 }
 
+/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero is
+/// not locked yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it out,
+/// but the setup check compared the request with the raw unlocked balance, so a taker holding
+/// an older quote could be accepted against Monero another swap needs, and one of the two was
+/// refunded at lock time (fork, 05/10/2026). Swaps whose Bitcoin is not seen yet reserve
+/// nothing, as for the quote: a setup alone must not freeze our liquidity.
+async fn reserved_monero_in_flight(db: &Arc<dyn Database + Send + Sync>) -> Result<monero::Amount> {
+    let reserved = db
+        .all()
+        .await?
+        .into_iter()
+        .filter_map(|(_, _, state)| match state {
+            State::Alice(state) => Some(crate::protocol::alice::ReservesMonero::reserved_monero(
+                &state,
+            )),
+            _ => None,
+        })
+        .fold(monero::Amount::ZERO, |acc, amount| acc + amount);
+    Ok(reserved)
+}
+
+/// The unlocked balance a new setup may use: what the swaps in flight reserved is left out.
+fn unreserved_balance(unlocked: monero::Amount, reserved: monero::Amount) -> monero::Amount {
+    monero::Amount::from_pico(unlocked.as_pico().saturating_sub(reserved.as_pico()))
+}
+
 async fn capture_wallet_snapshot(
     bitcoin_wallet: Arc<dyn BitcoinWallet>,
     monero_wallet: &monero::Wallets,
     external_redeem_address: &Option<bitcoin::Address>,
     btc_redeem_fee_multiplier: Decimal,
     transfer_amount: bitcoin::Amount,
+    reserved: monero::Amount,
 ) -> Result<WalletSnapshot> {
     let start_time = Instant::now();
 
@@ -1466,8 +1498,9 @@ async fn capture_wallet_snapshot(
 
     let unlocked_balance = monero_wallet.main_wallet().await.unlocked_balance().await?;
     let total_balance = monero_wallet.main_wallet().await.total_balance().await?;
+    let unreserved_balance = unreserved_balance(unlocked_balance.into(), reserved);
 
-    tracing::info!(%unlocked_balance, %total_balance, "Capturing monero wallet snapshot");
+    tracing::info!(%unlocked_balance, %total_balance, %reserved, %unreserved_balance, "Capturing monero wallet snapshot");
 
     let redeem_address = external_redeem_address
         .clone()
@@ -1511,7 +1544,7 @@ async fn capture_wallet_snapshot(
     tracing::debug!(duration_ms=%end_time.duration_since(start_time).as_millis(), "Finished capturing wallet snapshot");
 
     Ok(WalletSnapshot::new(
-        unlocked_balance.into(),
+        unreserved_balance,
         redeem_address,
         punish_address,
         tx_lock_fee,
@@ -2030,6 +2063,36 @@ impl<T> Default for MpscChannels<T> {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
         MpscChannels { sender, receiver }
+    }
+}
+
+#[cfg(test)]
+mod setup_reserve_tests {
+    use super::{monero, unreserved_balance};
+
+    /// 05/10/2026: 59.25 XMR unlocked while a 0.377 BTC swap reserved 58.66 XMR.
+    const UNLOCKED: u64 = 59_252_775_112_907;
+    const RESERVED: u64 = 58_660_884_011_220;
+
+    #[test]
+    fn a_setup_cannot_use_monero_another_swap_reserved() {
+        let left = unreserved_balance(
+            monero::Amount::from_pico(UNLOCKED),
+            monero::Amount::from_pico(RESERVED),
+        );
+        assert_eq!(left.as_pico(), UNLOCKED - RESERVED);
+    }
+
+    #[test]
+    fn an_over_reservation_leaves_zero() {
+        let left = unreserved_balance(monero::Amount::ZERO, monero::Amount::from_pico(1));
+        assert_eq!(left.as_pico(), 0);
+    }
+
+    #[test]
+    fn nothing_reserved_leaves_the_unlocked_balance() {
+        let left = unreserved_balance(monero::Amount::from_pico(UNLOCKED), monero::Amount::ZERO);
+        assert_eq!(left.as_pico(), UNLOCKED);
     }
 }
 

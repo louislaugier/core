@@ -1,0 +1,27 @@
+# Fork only (05/10/2026): build-asb-mutex builds the maker image but runs no test. This runs
+# the swap crate's unit tests of the Monero lock fixes (hot9: wait for locked change, hot10:
+# the setup check leaves out Monero reserved by swaps in flight) on every ci/** push.
+name: fork-unit-tests
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: free runner disk (monero-sys build needs >14 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+      - name: Unit tests of the lock and setup fixes
+        run: cargo test --package swap --lib -- unlock_wait_tests setup_reserve_tests
