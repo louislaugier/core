@@ -73,8 +73,10 @@ impl GetConfig for Mainnet {
             bitcoin_network: bitcoin::Network::Bitcoin,
             monero_avg_block_time: 2.std_minutes(),
             // If Alice cannot lock her Monero within this timeout,
-            // she will initiate an early refund of Bobs Bitcoin
-            monero_lock_retry_timeout: 30.std_minutes(),
+            // she will initiate an early refund of Bobs Bitcoin.
+            // 40 min (fork, 05/10/2026): a lock waiting for our own change to clear its
+            // 10-block lock must not be refunded first; the cancel timelock still bounds it.
+            monero_lock_retry_timeout: 40.std_minutes(),
             monero_lock_construction_cooldown: 5.std_minutes(),
             monero_finality_confirmations: 10,
             monero_double_spend_safe_confirmations: 10,

@@ -1594,14 +1594,75 @@ async fn ensure_lock_is_fundable(
     let unlocked_pico = unlocked.as_pico();
 
     if unlocked_pico < needed_pico {
-        return Err(backoff::Error::permanent(anyhow::anyhow!(
+        let total_pico = timeout(FUNDABILITY_CHECK_TIMEOUT, async {
+            monero_wallet
+                .main_wallet()
+                .await
+                .total_balance()
+                .await
+                .context("Failed to read the total Monero balance before constructing the lock")
+        })
+        .await
+        .context("Timed out reading the total Monero balance before constructing the lock")
+        .map_err(backoff::Error::transient)?
+        .map_err(backoff::Error::transient)?
+        .as_pico();
+
+        let short = anyhow::anyhow!(
             "Insufficient unlocked Monero to fund the lock transaction \
-             ({unlocked_pico} < {needed_pico} piconero); a concurrent swap consumed \
-             the shared balance, refunding this swap early"
-        )));
+             ({unlocked_pico} < {needed_pico} piconero, total {total_pico})"
+        );
+
+        // Our own Monero may still cover the lock: a sibling swap's lock leaves its change
+        // locked for 10 blocks (~20 min). Retry until it unlocks rather than refund a swap the
+        // wallet can fund (fork, 05/10/2026: on 4.14 a 0.377 BTC swap was refunded while a
+        // 0.002 BTC sibling held 15.4 XMR of change; the total covered both). The total spans
+        // every account: Monero outside account 0 only delays the same early refund.
+        return Err(
+            if waits_for_unlock(unlocked_pico, total_pico, needed_pico) {
+                backoff::Error::transient(
+                    short.context("Waiting for our locked change to unlock before locking Monero"),
+                )
+            } else {
+                backoff::Error::permanent(short.context(
+                    "A concurrent swap consumed the shared balance, refunding this swap early",
+                ))
+            },
+        );
     }
 
     Ok(())
+}
+
+/// Whether a lock the unlocked balance cannot fund yet should wait instead of refunding: the
+/// total balance (unlocked plus change still in its 10-block lock) covers it.
+fn waits_for_unlock(unlocked_pico: u64, total_pico: u64, needed_pico: u64) -> bool {
+    unlocked_pico < needed_pico && total_pico >= needed_pico
+}
+
+#[cfg(test)]
+mod unlock_wait_tests {
+    use super::waits_for_unlock;
+
+    /// 05/10/2026, swap 6662ebc5: 43.51 XMR unlocked, 58.91 XMR in total, 58.66 XMR needed.
+    const UNLOCKED: u64 = 43_510_399_743_274;
+    const TOTAL: u64 = 58_908_888_836_450;
+    const NEEDED: u64 = 58_657_784_011_220 + 1_000_000_000;
+
+    #[test]
+    fn waits_when_locked_change_covers_the_lock() {
+        assert!(waits_for_unlock(UNLOCKED, TOTAL, NEEDED));
+    }
+
+    #[test]
+    fn refunds_when_even_the_total_is_short() {
+        assert!(!waits_for_unlock(UNLOCKED, NEEDED - 1, NEEDED));
+    }
+
+    #[test]
+    fn nothing_to_wait_for_when_unlocked_covers_it() {
+        assert!(!waits_for_unlock(TOTAL, TOTAL, NEEDED));
+    }
 }
 
 /// Where `state` sits in the serialized Monero lock phase (see [`MONERO_LOCK_PHASE`]).
