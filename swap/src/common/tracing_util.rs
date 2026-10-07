@@ -104,11 +104,18 @@ pub fn init(
     );
 
     // Write libp2p to a log file (tracing-libp2p*.log). Fork (07/10/2026): INFO, not TRACE:
-    // under a connection flood TRACE wrote 6.4 GB/h.
+    // under a connection flood TRACE wrote 6.4 GB/h. Identify stays at TRACE (~2 % of it): its
+    // "Received" line is the only record of a peer's agent, which the dashboard reads.
     let libp2p_file_layer = json_rolling_layer!(
         &dir,
         "tracing-libp2p",
-        env_filter_with_all_crates(vec![(crates::LIBP2P_CRATES.to_vec(), LevelFilter::INFO)]),
+        env_filter_with_all_crates(vec![
+            (crates::LIBP2P_CRATES.to_vec(), LevelFilter::INFO),
+            (
+                crates::LIBP2P_FILE_TRACE_CRATES.to_vec(),
+                LevelFilter::TRACE
+            ),
+        ]),
         24
     );
 
@@ -281,6 +288,10 @@ pub(crate) mod crates {
     /// connections and yamux logs "maximum number of streams reached" at ERROR for each one
     /// (~70k lines/h); a global level in RUST_LOG (e.g. `warn`) let that into every log.
     pub const LIBP2P_FILE_ONLY_CRATES: &[&str] = &["yamux"];
+
+    /// Crates tracing-libp2p*.log keeps at TRACE (fork, 07/10/2026): identify's "Received" line
+    /// carries the peer's agent. Added after LIBP2P_CRATES, it replaces their INFO for these.
+    pub const LIBP2P_FILE_TRACE_CRATES: &[&str] = &["libp2p_identify"];
 }
 
 /// A writer that forwards tracing log messages to the tauri guest.
