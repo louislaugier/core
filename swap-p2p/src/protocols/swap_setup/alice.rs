@@ -30,6 +30,8 @@ use uuid::Uuid;
 #[allow(clippy::large_enum_variant)]
 pub enum OutEvent {
     Initiated {
+        // Fork (07/10/2026): who opened the setup, so the maker can refuse a flagged flood peer.
+        peer_id: PeerId,
         send_wallet_snapshot:
             bmrng::RequestReceiver<bitcoin::Amount, (WalletSnapshot, bitcoin::Amount, bool)>,
     },
@@ -102,8 +104,10 @@ impl From<OutEvent> for out_event::alice::OutEvent {
     fn from(event: OutEvent) -> Self {
         match event {
             OutEvent::Initiated {
+                peer_id,
                 send_wallet_snapshot,
             } => out_event::alice::OutEvent::SwapSetupInitiated {
+                peer_id,
                 send_wallet_snapshot,
             },
             OutEvent::Completed {
@@ -217,6 +221,7 @@ where
         match event {
             HandlerOutEvent::Initiated(send_wallet_snapshot) => {
                 self.events.push_back(OutEvent::Initiated {
+                    peer_id,
                     send_wallet_snapshot,
                 })
             }
