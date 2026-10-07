@@ -71,17 +71,20 @@ pub fn init(
             .with_file(true)
             .with_line_number(true)
             .json()
-            .with_filter(env_filter_with_all_crates(vec![(
-                crates::OUR_CRATES.to_vec(),
-                LevelFilter::DEBUG,
-            )])?)
+            .with_filter(env_filter_with_all_crates(vec![
+                (crates::OUR_CRATES.to_vec(), LevelFilter::DEBUG),
+                (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
+            ])?)
     };
 
     // Write our crates to a verbose log file (tracing*.log)
     let tracing_file_layer = json_rolling_layer!(
         &dir,
         "tracing",
-        env_filter_with_all_crates(vec![(crates::OUR_CRATES.to_vec(), LevelFilter::TRACE)]),
+        env_filter_with_all_crates(vec![
+            (crates::OUR_CRATES.to_vec(), LevelFilter::TRACE),
+            (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
+        ]),
         24
     );
 
@@ -92,16 +95,20 @@ pub fn init(
     let tor_file_layer = json_rolling_layer!(
         &dir,
         "tracing-tor",
-        env_filter_with_all_crates(vec![(crates::TOR_CRATES.to_vec(), LevelFilter::DEBUG)]),
+        env_filter_with_all_crates(vec![
+            (crates::TOR_CRATES.to_vec(), LevelFilter::DEBUG),
+            (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
+        ]),
         5,
         Rotation::MINUTELY
     );
 
-    // Write libp2p to a verbose log file (tracing-libp2p*.log)
+    // Write libp2p to a log file (tracing-libp2p*.log). Fork (07/10/2026): INFO, not TRACE:
+    // under a connection flood TRACE wrote 6.4 GB/h.
     let libp2p_file_layer = json_rolling_layer!(
         &dir,
         "tracing-libp2p",
-        env_filter_with_all_crates(vec![(crates::LIBP2P_CRATES.to_vec(), LevelFilter::TRACE)]),
+        env_filter_with_all_crates(vec![(crates::LIBP2P_CRATES.to_vec(), LevelFilter::INFO)]),
         24
     );
 
@@ -109,10 +116,10 @@ pub fn init(
     let monero_wallet_file_layer = json_rolling_layer!(
         &dir,
         "tracing-monero-wallet",
-        env_filter_with_all_crates(vec![(
-            crates::MONERO_WALLET_CRATES.to_vec(),
-            LevelFilter::TRACE
-        )]),
+        env_filter_with_all_crates(vec![
+            (crates::MONERO_WALLET_CRATES.to_vec(), LevelFilter::TRACE),
+            (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
+        ]),
         24
     );
 
@@ -151,10 +158,12 @@ pub fn init(
             (crates::MONERO_WALLET_CRATES.to_vec(), LevelFilter::INFO),
             (crates::LIBP2P_CRATES.to_vec(), LevelFilter::INFO),
             (crates::TOR_CRATES.to_vec(), LevelFilter::INFO),
+            (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
         ])?,
-        false => {
-            env_filter_with_all_crates(vec![(crates::OUR_CRATES.to_vec(), LevelFilter::INFO)])?
-        }
+        false => env_filter_with_all_crates(vec![
+            (crates::OUR_CRATES.to_vec(), LevelFilter::INFO),
+            (crates::LIBP2P_FILE_ONLY_CRATES.to_vec(), LevelFilter::OFF),
+        ])?,
     };
 
     let final_terminal_layer = match format {
@@ -206,7 +215,7 @@ fn env_filter_with_all_crates(crates: Vec<(Vec<&str>, LevelFilter)>) -> Result<E
     Ok(filter)
 }
 
-mod crates {
+pub(crate) mod crates {
     pub const TOR_CRATES: &[&str] = &[
         "arti",
         "arti_client",
@@ -267,6 +276,11 @@ mod crates {
     ];
 
     pub const MONERO_WALLET_CRATES: &[&str] = &["monero_cpp", "monero_rpc_pool"];
+
+    /// Crates only tracing-libp2p*.log may show (fork, 07/10/2026). A flood overloads
+    /// connections and yamux logs "maximum number of streams reached" at ERROR for each one
+    /// (~70k lines/h); a global level in RUST_LOG (e.g. `warn`) let that into every log.
+    pub const LIBP2P_FILE_ONLY_CRATES: &[&str] = &["yamux"];
 }
 
 /// A writer that forwards tracing log messages to the tauri guest.

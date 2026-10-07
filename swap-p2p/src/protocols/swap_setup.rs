@@ -12,6 +12,12 @@ mod vendor_from_fn;
 
 pub const BUF_SIZE: usize = 1024 * 1024;
 
+/// Log target of the lines a swap setup flood repeats per attempt (fork, 07/10/2026).
+///
+/// No log file filter names it, so these `trace!` lines are off unless `RUST_LOG` has
+/// `flood=trace`: a flood once wrote ~280 MB/h of them to swap-all.log and more to tracing*.log.
+pub const FLOOD_LOG_TARGET: &str = "flood";
+
 pub mod protocol {
     use futures::future;
     use libp2p::core::Endpoint;
@@ -156,7 +162,16 @@ where
         .await
         .context("Failed to read length-prefixed message from stream")??;
 
-    let mut de = serde_cbor::Deserializer::from_slice(&bytes);
+    decode_cbor_message(&bytes)
+}
+
+/// Decodes one swap setup message as [`read_cbor_message`] reads it: `Ok(message)` or
+/// `Err(error)` in CBOR.
+pub fn decode_cbor_message<T>(bytes: &[u8]) -> Result<Result<T, SwapSetupError>>
+where
+    T: DeserializeOwned,
+{
+    let mut de = serde_cbor::Deserializer::from_slice(bytes);
     let message = Result::<T, SwapSetupError>::deserialize(&mut de)
         .context("Failed to deserialize bytes into message using CBOR")?;
 
