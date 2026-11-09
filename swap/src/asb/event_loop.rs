@@ -2972,6 +2972,8 @@ mod tests {
         let expected_max = balance
             .max_bitcoin_for_price(rate.value().ask().unwrap())
             .unwrap();
+        // fork 0a35db09e: the published max is 1 % under the lockable balance
+        let expected_max = bitcoin::Amount::from_sat(expected_max.to_sat() / 100 * 99);
         assert_eq!(result.min_quantity, min_buy);
         assert_eq!(result.max_quantity, expected_max);
     }
@@ -3086,6 +3088,8 @@ mod tests {
         let expected_max = unreserved
             .max_bitcoin_for_price(rate.value().ask().unwrap())
             .unwrap();
+        // fork 0a35db09e: the published max is 1 % under the lockable balance
+        let expected_max = bitcoin::Amount::from_sat(expected_max.to_sat() / 100 * 99);
 
         assert_eq!(result.min_quantity, min_buy);
         assert_eq!(result.max_quantity, expected_max);
