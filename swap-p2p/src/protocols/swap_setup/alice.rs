@@ -2,8 +2,8 @@ use crate::out_event;
 use crate::protocols::swap_setup;
 use crate::protocols::swap_setup::verification::{LockInputVerifier, VerificationError};
 use crate::protocols::swap_setup::{
-    BlockchainNetwork, BobDecision, SpotPriceError, SpotPriceRequest, SpotPriceResponse,
-    SwapPersisted, protocol,
+    BlockchainNetwork, BobDecision, FLOOD_LOG_TARGET, SpotPriceError, SpotPriceRequest,
+    SpotPriceResponse, SwapPersisted, protocol,
 };
 use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
@@ -84,6 +84,8 @@ pub struct RegisterSwap {
 #[allow(clippy::large_enum_variant)]
 pub enum OutEvent {
     Initiated {
+        /// Fork (07/10/2026): who opened the setup, so the maker can refuse a flagged flood peer.
+        peer_id: PeerId,
         /// Span of this swap setup. Work it requests from the event loop is logged under it.
         span: tracing::Span,
         send_wallet_snapshot:
@@ -144,11 +146,13 @@ impl From<OutEvent> for out_event::alice::OutEvent {
     fn from(event: OutEvent) -> Self {
         match event {
             OutEvent::Initiated {
+                peer_id,
                 span,
                 send_wallet_snapshot,
                 check_lock_inputs,
                 register_swap,
             } => out_event::alice::OutEvent::SwapSetupInitiated {
+                peer_id,
                 span,
                 send_wallet_snapshot,
                 check_lock_inputs,
@@ -273,6 +277,7 @@ where
                 check_lock_inputs,
                 register_swap,
             } => self.events.push_back(OutEvent::Initiated {
+                peer_id,
                 span,
                 send_wallet_snapshot,
                 check_lock_inputs,
@@ -369,7 +374,7 @@ pub enum HandlerOutEvent {
 
 impl<LR> ConnectionHandler for Handler<LR>
 where
-    LR: LatestRate + Send + 'static,
+    LR: LatestRate + Send + 'static + Clone,
 {
     type FromBehaviour = ();
     type ToBehaviour = HandlerOutEvent;
@@ -413,7 +418,9 @@ where
                 let resume_only = self.resume_only;
                 let min_buy = self.min_buy;
                 let max_buy = self.max_buy;
-                let latest_rate = self.latest_rate.latest_rate();
+                // Fork (07/10/2026): the setup reads the rate itself, once it has its wallet
+                // snapshot, so a flood setup that never gets one logs no rate line.
+                let latest_rate = self.latest_rate.clone();
                 let env_config = self.env_config;
 
                 // We wrap the handshake in a timeout future
@@ -429,9 +436,7 @@ where
                         env_config,
                         min_buy,
                         max_buy,
-                        latest_rate.map_err(|error| {
-                            Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>
-                        }),
+                        latest_rate,
                     ),
                 );
                 let peer_id = self.peer_id;
@@ -451,7 +456,11 @@ where
                 let max_seconds = self.negotiation_timeout.as_secs();
                 self.inbound_streams.push(
                     async move {
-                        tracing::debug!("Inbound swap setup negotiation started");
+                        // Fork (07/10/2026): one line per setup a flood opens, hence TRACE.
+                        tracing::trace!(
+                            target: FLOOD_LOG_TARGET,
+                            "Inbound swap setup negotiation started"
+                        );
 
                         let Ok(negotiated) = negotiation.await else {
                             tracing::warn!(timeout_seconds = max_seconds, "Swap setup timed out");
@@ -482,6 +491,14 @@ where
                         match &result {
                             Ok(swap_id) => {
                                 tracing::info!(%swap_id, "Swap setup completed")
+                            }
+                            // Fork (07/10/2026): the maker flags the peer and logs it once.
+                            Err(error) if is_undecodable_spot_price_request(error) => {
+                                tracing::trace!(
+                                    target: FLOOD_LOG_TARGET,
+                                    error = ?error,
+                                    "Swap setup failed"
+                                )
                             }
                             Err(error) => {
                                 tracing::warn!(error = %format!("{error:#}"), "Swap setup failed")
@@ -553,6 +570,31 @@ impl SpotPriceResponse {
     }
 }
 
+/// The first message of a swap setup did not decode (fork, 07/10/2026).
+///
+/// Takers from before the v4 hardfork, and a bot flooding the maker over its onion since
+/// 07/10/2026, send the spot price request as a bare CBOR map instead of `Ok(request)`: "invalid
+/// type: map, expected `Ok` or `Err`". Such a setup can never succeed, so the maker flags the
+/// peer like a flood peer.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to read spot price request")]
+pub struct UndecodableSpotPriceRequest;
+
+/// Adds the context of a failed spot price request read: [`UndecodableSpotPriceRequest`] when
+/// the message came but did not decode, a plain message otherwise (e.g. a closed stream).
+pub fn spot_price_read_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<serde_cbor::Error>() {
+        error.context(UndecodableSpotPriceRequest)
+    } else {
+        error.context("Failed to read spot price request")
+    }
+}
+
+/// True for a swap setup that failed because its spot price request did not decode.
+pub fn is_undecodable_spot_price_request(error: &anyhow::Error) -> bool {
+    error.is::<UndecodableSpotPriceRequest>()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("ASB is running in resume-only mode")]
@@ -609,7 +651,7 @@ impl Error {
     }
 }
 
-async fn run_swap_setup(
+async fn run_swap_setup<LR: LatestRate>(
     substream: libp2p::swarm::Stream,
     sender: bmrng::RequestSender<bitcoin::Amount, (WalletSnapshot, bitcoin::Amount, bool)>,
     check_lock_inputs: bmrng::RequestSender<
@@ -622,12 +664,12 @@ async fn run_swap_setup(
     env_config: env::Config,
     min_buy: bitcoin::Amount,
     max_buy: bitcoin::Amount,
-    latest_rate: Result<swap_feed::Rate, Box<dyn std::error::Error + Send + Sync + 'static>>,
+    mut latest_rate: LR,
 ) -> Result<(Uuid, State3, LockInputReservation, swap_setup::SetupStream)> {
     let mut substream = swap_setup::framed(substream);
     let request = swap_setup::read_cbor_message::<SpotPriceRequest>(&mut substream)
         .await
-        .context("Failed to read spot price request")?
+        .map_err(spot_price_read_error)?
         .context("Peer sent an error instead of spot price request")?;
     tracing::debug!(btc = %request.btc, "Received spot price request");
 
@@ -671,7 +713,9 @@ async fn run_swap_setup(
             });
         }
 
-        let rate = latest_rate.map_err(Error::LatestRateFetchFailed)?;
+        let rate = latest_rate
+            .latest_rate()
+            .map_err(|error| Error::LatestRateFetchFailed(Box::new(error)))?;
         let xmr = rate
             .sell_quote(btc)
             .map_err(Error::SellQuoteCalculationFailed)?;

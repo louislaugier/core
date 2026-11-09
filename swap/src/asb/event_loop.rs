@@ -7,8 +7,10 @@ use crate::monero;
 use crate::network::cooperative_xmr_redeem_after_punish::CooperativeXmrRedeemRejectReason;
 use crate::network::cooperative_xmr_redeem_after_punish::Response::{Fullfilled, Rejected};
 use crate::network::quote::{BidQuote, RefundPolicyWire};
+use crate::network::swap_setup::FLOOD_LOG_TARGET;
 use crate::network::swap_setup::alice::{
     LockInputCheck, LockInputCheckError, LockInputReservation, RegisterSwap, WalletSnapshot,
+    is_undecodable_spot_price_request,
 };
 use crate::network::transfer_proof;
 use crate::protocol::alice::swap::has_already_processed_enc_sig;
@@ -26,7 +28,8 @@ use libp2p::{PeerId, Swarm};
 use moka::{future::Cache as AsyncCache, sync::Cache};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::io::Write;
@@ -42,6 +45,16 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tor_hsservice::RunningOnionService;
 use tracing::Instrument;
 use uuid::Uuid;
+
+/// How many flood peers (see [`FloodPeers`]) are remembered; the oldest is forgotten first.
+const FLOOD_PEERS_CAP: usize = 10_000;
+
+/// How long a flood peer stays flagged: a pre-v4 taker flagged for an undecodable setup can
+/// swap again this long after it upgrades (fork, 07/10/2026).
+const FLOOD_PEER_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// One `info!` per this many dropped flood connections; each drop alone is a `trace!`.
+const FLOOD_DROPS_LOG_EVERY: u64 = 1_000;
 
 /// How often config.toml is checked for a changed `maker.ask_spread`.
 const CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(10);
@@ -140,6 +153,7 @@ where
             'static,
             (
                 tracing::Span,
+                PeerId,
                 Result<(
                     bitcoin::Amount,
                     bmrng::Responder<(WalletSnapshot, bitcoin::Amount, bool)>,
@@ -148,6 +162,14 @@ where
             ),
         >,
     >,
+
+    /// Flood peers (fork, 07/10/2026): the js-libp2p bot's identify agent, or a swap setup
+    /// request that does not decode. Their connections are dropped, their swap setups refused,
+    /// their setup errors logged at TRACE on [`FLOOD_LOG_TARGET`].
+    flood_peers: FloodPeers<PeerId>,
+
+    /// Flood connections dropped since start, for the `info!` every [`FLOOD_DROPS_LOG_EVERY`].
+    flood_drops: u64,
 
     /// Swap setup handlers waiting to send Bob's verified TxLock PSBT.
     /// Each future resolves with the PSBT and the responder, or `None` if the
@@ -311,6 +333,8 @@ where
             pending_quote_channels: Default::default(),
             pending_quote_controller_responders: Default::default(),
             inflight_wallet_snapshots: Default::default(),
+            flood_peers: FloodPeers::new(FLOOD_PEERS_CAP, FLOOD_PEER_TTL),
+            flood_drops: 0,
             inflight_lock_input_requests: Default::default(),
             inflight_swap_registrations: Default::default(),
             inflight_lock_input_checks: Default::default(),
@@ -405,7 +429,15 @@ where
                     }
 
                     match swarm_event {
-                        SwarmEvent::Behaviour(OutEvent::SwapSetupInitiated { span, mut send_wallet_snapshot, mut check_lock_inputs, mut register_swap }) => {
+                        SwarmEvent::Behaviour(OutEvent::SwapSetupInitiated { peer_id, span, mut send_wallet_snapshot, mut check_lock_inputs, mut register_swap }) => {
+                            // Fork (07/10/2026): a peer already flagged as a flood peer gets no
+                            // wallet work. Dropping the receivers fails its setup.
+                            if self.is_flood_peer(&peer_id) {
+                                tracing::trace!(target: FLOOD_LOG_TARGET, peer = %peer_id, "Refused the swap setup of a flood peer");
+                                let _ = self.swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
+
                             let bitcoin_wallet = self.bitcoin_wallet.clone();
                             let monero_wallet = self.monero_wallet.clone();
                             let external_redeem_address = self.external_redeem_address.clone();
@@ -417,7 +449,7 @@ where
                             let snapshot_span = span.clone();
                             self.inflight_wallet_snapshots.push(async move {
                                 // Wait for the swap setup handler to request the wallet snapshot
-                                let (btc, responder) = send_wallet_snapshot.recv().await?;
+                                let (btc, responder) = send_wallet_snapshot.recv().await.context(SetupEndedEarly)?;
                                 tracing::debug!(%btc, "Creating wallet snapshot for swap setup");
 
                                 let wallet_state = get_cached_wallet_snapshot_state(
@@ -455,7 +487,7 @@ where
 
                                 // This is used further down to then actually respond to the swap setup handler
                                 Ok((btc, responder, wallet_snapshot))
-                            }.instrument(snapshot_span.clone()).map(|result| (snapshot_span, result)).boxed());
+                            }.instrument(snapshot_span.clone()).map(move |result| (snapshot_span, peer_id, result)).boxed());
 
                             let request_span = span.clone();
                             self.inflight_lock_input_requests.push(async move {
@@ -612,9 +644,19 @@ where
                                 "Failed to receive request-response request from peer");
                         }
                         SwarmEvent::Behaviour(OutEvent::Failure {peer, error}) => {
-                            tracing::warn!(
-                                %peer,
-                                "Communication error: {:?}", error);
+                            if self.is_flood_peer(&peer) {
+                                tracing::trace!(target: FLOOD_LOG_TARGET, %peer, "Communication error with a flood peer: {:#}", error);
+                            } else if is_undecodable_spot_price_request(&error) {
+                                // Fork (07/10/2026): a bot floods us over the onion with setups
+                                // whose request does not decode (pre-v4 bare CBOR), up to 1,139 a
+                                // peer. None can succeed: flag the peer once, refuse the rest.
+                                tracing::debug!(%peer, "Flagged a peer whose swap setup request does not decode: {:#}", error);
+                                self.drop_flood_peer(peer, "undecodable swap setup request");
+                            } else {
+                                tracing::warn!(
+                                    %peer,
+                                    "Communication error: {:?}", error);
+                            }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id: peer, endpoint, .. } => {
                             tracing::trace!(%peer, address = %endpoint.get_remote_address(), "New connection established");
@@ -657,6 +699,15 @@ where
                         SwarmEvent::Behaviour(OutEvent::Identify(identify_event)) => {
                             if let Some(metrics) = &self.metrics {
                                 metrics.record(identify_event.as_ref());
+                            }
+
+                            // Fork (07/10/2026): a js-libp2p bot floods us with swap setups it
+                            // aborts, from a fresh peer id per connection, so per-peer bans miss
+                            // it. Its identify agent gives it away: drop the connection there.
+                            if let libp2p::identify::Event::Received { peer_id, info, .. } = &*identify_event {
+                                if is_flood_agent(&info.agent_version) {
+                                    self.drop_flood_peer(*peer_id, &info.agent_version);
+                                }
                             }
                         }
                         SwarmEvent::NewListenAddr{address, .. } => {
@@ -725,9 +776,19 @@ where
                 // 2. We push a future to `inflight_wallet_snapshots` that waits for the swap setup handler to
                 //    request the wallet snapshot (with the BTC amount), then computes it
                 // 3. Once the future resolves, we compute the amnesty amount and respond to the swap setup handler
-                Some((span, result)) = self.inflight_wallet_snapshots.next() => {
+                Some((span, peer, result)) = self.inflight_wallet_snapshots.next() => {
                     let (btc, responder, wallet_snapshot) = match result {
                         Ok((btc, responder, wallet_snapshot)) => (btc, responder, wallet_snapshot),
+                        Err(error) if self.is_flood_peer(&peer) => {
+                            // A flood peer flagged after its setup began: expected, not an error.
+                            tracing::trace!(target: FLOOD_LOG_TARGET, %peer, "Dropped the swap setup of a flood peer: {:#}", error);
+                            continue;
+                        }
+                        Err(error) if error.is::<SetupEndedEarly>() => {
+                            // Fork (07/10/2026): the handler logs why the setup ended.
+                            tracing::debug!(parent: &span, %peer, "Swap setup ended before it asked for a wallet snapshot");
+                            continue;
+                        }
                         Err(error) => {
                             // TODO: Propagate error to the swap_setup handler instead of swallowing it
                             tracing::error!(parent: &span, error = %format!("{error:#}"), "Swap request will be ignored because we were unable to create wallet snapshot for swap");
@@ -909,6 +970,27 @@ where
     /// consumer for the next quote result (p2p quote protocol, controller
     /// RPC) to guarantee there is a future that will eventually wake up
     /// the result-draining select arm.
+    /// Flags `peer` as a flood peer and drops its connections (fork, 07/10/2026).
+    ///
+    /// One `trace!` per drop on [`FLOOD_LOG_TARGET`]: the js-libp2p bot opens thousands of
+    /// connections a minute. `reason` is its identify agent, or why else it was flagged.
+    fn drop_flood_peer(&mut self, peer: PeerId, reason: &str) {
+        self.flood_peers.insert(peer, Instant::now());
+        self.flood_drops += 1;
+
+        let disconnected = self.swarm.disconnect_peer_id(peer).is_ok();
+        tracing::trace!(target: FLOOD_LOG_TARGET, %peer, %reason, disconnected, "Dropped a flood connection");
+
+        if self.flood_drops.is_multiple_of(FLOOD_DROPS_LOG_EVERY) {
+            tracing::info!(drops = self.flood_drops, "Dropped flood connections");
+        }
+    }
+
+    /// True while `peer` is flagged as a flood peer (fork, 07/10/2026).
+    fn is_flood_peer(&self, peer: &PeerId) -> bool {
+        self.flood_peers.contains(peer, Instant::now())
+    }
+
     fn ensure_quote_computation_is_inflight(&mut self) {
         if self.inflight_quote_computation.len() == 1 {
             self.inflight_quote_computation
@@ -2340,6 +2422,215 @@ impl<T> Default for MpscChannels<T> {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
         MpscChannels { sender, receiver }
+    }
+}
+
+/// True for the identify agent of the bot that floods the maker with aborted swap setups
+/// since 06/10/2026: js-libp2p on Node, e.g. `libp2p/1.9.4 UserAgent=v22.22.2`.
+///
+/// Takers (`cli/...`), makers (`asb/...`) and rust-libp2p crawlers never match.
+fn is_flood_agent(agent: &str) -> bool {
+    agent.starts_with("libp2p/") && agent.contains("UserAgent=")
+}
+
+/// A swap setup that ended before it asked for a wallet snapshot (fork, 07/10/2026).
+///
+/// Its handler dropped the request channel ("request channel closed") and reports the cause
+/// itself, so the snapshot side logs it at debug, not as an error.
+#[derive(Debug, thiserror::Error)]
+#[error("the swap setup ended before it asked for a wallet snapshot")]
+struct SetupEndedEarly;
+
+/// A set that keeps at most `cap` items, forgets the oldest first, and lets an item lapse `ttl`
+/// after it was last flagged (fork, 07/10/2026).
+///
+/// Holds the flood peers: the js-libp2p bot uses a fresh peer id per connection, so the set only
+/// has to cover a peer's own connection, and must not grow with the flood. A peer flagged for an
+/// undecodable setup may be a pre-v4 taker: the lapse lets it swap once it upgrades.
+struct FloodPeers<T> {
+    items: HashMap<T, Instant>,
+    order: VecDeque<T>,
+    cap: usize,
+    ttl: Duration,
+}
+
+impl<T: Clone + Eq + Hash> FloodPeers<T> {
+    fn new(cap: usize, ttl: Duration) -> Self {
+        Self {
+            items: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+            ttl,
+        }
+    }
+
+    /// Flags `item` at `now`; flagging it again restarts its `ttl`.
+    fn insert(&mut self, item: T, now: Instant) {
+        if self.items.insert(item.clone(), now).is_some() {
+            return;
+        }
+        self.order.push_back(item);
+
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.items.remove(&oldest);
+            }
+        }
+    }
+
+    fn contains(&self, item: &T, now: Instant) -> bool {
+        self.items
+            .get(item)
+            .is_some_and(|flagged| now.saturating_duration_since(*flagged) < self.ttl)
+    }
+}
+
+#[cfg(test)]
+mod flood_agent_tests {
+    use super::{FLOOD_PEER_TTL, FloodPeers, is_flood_agent};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_js_libp2p_flood_bot_is_flagged() {
+        assert!(is_flood_agent("libp2p/1.9.4 UserAgent=v22.22.2"));
+        assert!(is_flood_agent("libp2p/1.9.4 UserAgent=v22.15.0"));
+    }
+
+    #[test]
+    fn takers_makers_and_rust_crawlers_are_left_alone() {
+        for agent in [
+            "cli/4.15.0 (xmr-btc-swap-mainnet)",
+            "asb/4.14.0 (xmr-btc-swap-mainnet)",
+            "rust-libp2p/0.44.2",
+            "",
+        ] {
+            assert!(!is_flood_agent(agent), "{agent:?} must not be flagged");
+        }
+    }
+
+    #[test]
+    fn the_flagged_set_forgets_the_oldest_peer_past_its_cap() {
+        let now = Instant::now();
+        let mut peers = FloodPeers::new(2, FLOOD_PEER_TTL);
+        peers.insert(1, now);
+        peers.insert(2, now);
+        peers.insert(3, now);
+
+        assert!(!peers.contains(&1, now));
+        assert!(peers.contains(&2, now));
+        assert!(peers.contains(&3, now));
+        assert_eq!(peers.order.len(), 2);
+    }
+
+    #[test]
+    fn a_peer_flagged_twice_takes_one_slot() {
+        let now = Instant::now();
+        let mut peers = FloodPeers::new(2, FLOOD_PEER_TTL);
+        peers.insert(1, now);
+        peers.insert(1, now);
+        peers.insert(2, now);
+
+        assert!(peers.contains(&1, now));
+        assert!(peers.contains(&2, now));
+        assert_eq!(peers.order.len(), 2);
+    }
+
+    #[test]
+    fn a_flag_lapses_after_its_ttl() {
+        let start = Instant::now();
+        let mut peers = FloodPeers::new(2, FLOOD_PEER_TTL);
+        peers.insert(1, start);
+
+        assert!(peers.contains(&1, start + FLOOD_PEER_TTL - Duration::from_secs(1)));
+        assert!(!peers.contains(&1, start + FLOOD_PEER_TTL));
+    }
+
+    #[test]
+    fn flagging_a_peer_again_restarts_its_ttl() {
+        let start = Instant::now();
+        let mut peers = FloodPeers::new(2, FLOOD_PEER_TTL);
+        peers.insert(1, start);
+        peers.insert(1, start + FLOOD_PEER_TTL);
+
+        assert!(peers.contains(&1, start + FLOOD_PEER_TTL + Duration::from_secs(1)));
+        assert_eq!(peers.order.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod flood_decode_tests {
+    use super::SetupEndedEarly;
+    use crate::common::tracing_util::crates;
+    use crate::network::swap_setup::alice::{
+        is_undecodable_spot_price_request, spot_price_read_error,
+    };
+    use crate::network::swap_setup::{FLOOD_LOG_TARGET, SpotPriceRequest, decode_cbor_message};
+    use anyhow::{Context, anyhow};
+    use std::time::Duration;
+
+    /// `{"a": 1, "b": 2}`: a request sent as a bare map instead of `Ok(request)`, like the
+    /// onion flood's ("invalid type: map, expected `Ok` or `Err`").
+    const BARE_MAP: [u8; 7] = [0xa2, 0x61, b'a', 0x01, 0x61, b'b', 0x02];
+
+    #[test]
+    fn a_bare_map_request_flags_its_peer() {
+        let error = decode_cbor_message::<SpotPriceRequest>(&BARE_MAP)
+            .err()
+            .expect("a bare map is not a v4 message");
+        // The swap setup behaviour hands the handler's error on as `anyhow!(error)`.
+        let error = anyhow!(spot_price_read_error(error));
+
+        assert!(is_undecodable_spot_price_request(&error));
+        assert!(format!("{error:#}").starts_with("Failed to read spot price request: "));
+    }
+
+    #[test]
+    fn a_closed_stream_does_not_flag_its_peer() {
+        let closed = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        let error = anyhow!(spot_price_read_error(anyhow!(closed)));
+
+        assert!(!is_undecodable_spot_price_request(&error));
+        assert!(format!("{error:#}").starts_with("Failed to read spot price request: "));
+    }
+
+    #[test]
+    fn other_setup_errors_do_not_flag_their_peer() {
+        let error = anyhow!("Failed to receive wallet snapshot");
+
+        assert!(!is_undecodable_spot_price_request(&error));
+    }
+
+    #[tokio::test]
+    async fn a_setup_that_never_asked_for_a_snapshot_is_told_apart() {
+        let (sender, mut receiver) =
+            bmrng::channel_with_timeout::<u8, u8>(1, Duration::from_secs(1));
+        drop(sender);
+
+        let error = receiver
+            .recv()
+            .await
+            .context(SetupEndedEarly)
+            .err()
+            .expect("no setup is left to ask");
+
+        assert!(error.is::<SetupEndedEarly>());
+    }
+
+    #[test]
+    fn flood_lines_match_no_log_file_filter() {
+        // A filter directive matches every target its name prefixes ("swap" covers "swap_p2p").
+        let groups = [
+            crates::OUR_CRATES,
+            crates::LIBP2P_CRATES,
+            crates::TOR_CRATES,
+            crates::MONERO_WALLET_CRATES,
+        ];
+        for name in groups.concat() {
+            assert!(
+                !FLOOD_LOG_TARGET.starts_with(name),
+                "{name} would log flood lines"
+            );
+        }
     }
 }
 
