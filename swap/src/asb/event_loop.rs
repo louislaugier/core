@@ -412,6 +412,7 @@ where
                             let btc_swap_fee_rate_multiplier = self.btc_swap_fee_rate_multiplier;
                             let btc_redeem_base_fee_multiplier = self.btc_redeem_base_fee_multiplier;
                             let wallet_snapshot_cache = self.wallet_snapshot_cache.clone();
+                            let db_for_reservations = self.db.clone();
 
                             let snapshot_span = span.clone();
                             self.inflight_wallet_snapshots.push(async move {
@@ -431,6 +432,18 @@ where
                                     },
                                 )
                                 .await?;
+
+                                // Monero the swaps in flight already count on must not back this
+                                // setup too (fork 2739e89e0, 05/10/2026). Read fresh on every setup,
+                                // OUTSIDE the cached wallet state (TTL 20 s), so a reservation made
+                                // inside the TTL is never missed.
+                                let reserved = reserved_monero_in_flight(&db_for_reservations).await?;
+                                let wallet_state = WalletSnapshotState {
+                                    unlocked_balance: unreserved_balance(wallet_state.unlocked_balance, reserved),
+                                    ..wallet_state
+                                };
+                                tracing::info!(%reserved, unreserved_balance = %wallet_state.unlocked_balance, "Setup balance after in-flight reservations");
+
                                 let wallet_snapshot = create_wallet_snapshot(
                                     bitcoin_wallet,
                                     wallet_state,
@@ -1714,6 +1727,36 @@ struct WalletSnapshotState {
     punish_address: bitcoin::Address,
 }
 
+/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero is
+/// not locked yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it out,
+/// but the setup check compared the request with the raw unlocked balance, so a taker holding
+/// an older quote could be accepted against Monero another swap needs, and one of the two was
+/// refunded at lock time (fork 2739e89e0, 05/10/2026). Swaps whose Bitcoin is not seen yet
+/// reserve nothing, as for the quote: a setup alone must not freeze our liquidity.
+async fn reserved_monero_in_flight(
+    db: &Arc<dyn Database + Send + Sync>,
+) -> Result<swap_core::monero::Amount> {
+    use crate::protocol::alice::ReservesMonero;
+    let reserved = db
+        .all()
+        .await?
+        .into_iter()
+        .filter_map(|(_, _, state)| match state {
+            State::Alice(state) => Some(state.reserved_monero()),
+            _ => None,
+        })
+        .fold(swap_core::monero::Amount::ZERO, |acc, amount| acc + amount);
+    Ok(reserved)
+}
+
+/// The unlocked balance a new setup may use: what the swaps in flight reserved is left out.
+fn unreserved_balance(
+    unlocked: swap_core::monero::Amount,
+    reserved: swap_core::monero::Amount,
+) -> swap_core::monero::Amount {
+    swap_core::monero::Amount::from_pico(unlocked.as_pico().saturating_sub(reserved.as_pico()))
+}
+
 async fn get_cached_wallet_snapshot_state(
     cache: &AsyncCache<(), WalletSnapshotState>,
     capture: impl std::future::Future<Output = Result<WalletSnapshotState>>,
@@ -2297,6 +2340,34 @@ impl<T> Default for MpscChannels<T> {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
         MpscChannels { sender, receiver }
+    }
+}
+
+#[cfg(test)]
+mod setup_reserve_tests {
+    use super::unreserved_balance;
+    use swap_core::monero::Amount;
+
+    /// 05/10/2026: 59.25 XMR unlocked while a 0.377 BTC swap reserved 58.66 XMR.
+    const UNLOCKED: u64 = 59_252_775_112_907;
+    const RESERVED: u64 = 58_660_884_011_220;
+
+    #[test]
+    fn a_setup_cannot_use_monero_another_swap_reserved() {
+        let left = unreserved_balance(Amount::from_pico(UNLOCKED), Amount::from_pico(RESERVED));
+        assert_eq!(left.as_pico(), UNLOCKED - RESERVED);
+    }
+
+    #[test]
+    fn an_over_reservation_leaves_zero() {
+        let left = unreserved_balance(Amount::ZERO, Amount::from_pico(1));
+        assert_eq!(left.as_pico(), 0);
+    }
+
+    #[test]
+    fn nothing_reserved_leaves_the_unlocked_balance() {
+        let left = unreserved_balance(Amount::from_pico(UNLOCKED), Amount::ZERO);
+        assert_eq!(left.as_pico(), UNLOCKED);
     }
 }
 
