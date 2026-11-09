@@ -16,6 +16,8 @@ use crate::protocols::{
 #[derive(Debug)]
 pub enum OutEvent {
     SwapSetupInitiated {
+        // The peer that opened the setup (fork, 07/10/2026: lets the maker refuse a flood peer).
+        peer_id: PeerId,
         // Span of this swap setup. Work it requests from us is logged under it.
         span: tracing::Span,
         // run_swap_setup in connection handler sends us the amount of
