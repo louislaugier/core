@@ -528,6 +528,20 @@ struct Seller {
     seller: Multiaddr,
 }
 
+/// `--receive-address`: parsed on any network here; buy_xmr checks it against the config.
+fn parse_monero_address(s: &str) -> Result<monero_address::MoneroAddress> {
+    monero_address::MoneroAddress::from_str_with_unchecked_network(s)
+        .map_err(|e| anyhow::anyhow!("Invalid Monero address: {}", e))
+}
+
+/// A rendezvous multiaddr `.../p2p/<peer id>` split the way ContextBuilder wants it.
+fn split_rendezvous(mut addr: Multiaddr) -> Result<(libp2p::PeerId, Vec<Multiaddr>)> {
+    match addr.pop() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Ok((peer_id, vec![addr])),
+        _ => anyhow::bail!("rendezvous point must end in /p2p/<peer id>: {addr}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,19 +702,5 @@ mod tests {
             tor: Default::default(),
         };
         simple_positive(&raw_ars, (true, true, None), cli_cmd).await;
-    }
-}
-
-/// `--receive-address`: parsed on any network here; buy_xmr checks it against the config.
-fn parse_monero_address(s: &str) -> Result<monero_address::MoneroAddress> {
-    monero_address::MoneroAddress::from_str_with_unchecked_network(s)
-        .map_err(|e| anyhow::anyhow!("Invalid Monero address: {}", e))
-}
-
-/// A rendezvous multiaddr `.../p2p/<peer id>` split the way ContextBuilder wants it.
-fn split_rendezvous(mut addr: Multiaddr) -> Result<(libp2p::PeerId, Vec<Multiaddr>)> {
-    match addr.pop() {
-        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Ok((peer_id, vec![addr])),
-        _ => anyhow::bail!("rendezvous point must end in /p2p/<peer id>: {addr}"),
     }
 }
