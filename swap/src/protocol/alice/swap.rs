@@ -383,6 +383,23 @@ where
                                 .context("Failed to construct Monero lock transaction")
                                 .map_err(backoff::Error::transient)?;
 
+                            // Fork (12/11/2026): ask the daemon about the inputs wallet2 picked.
+                            // wallet2 still counts the inputs of a relayed, unconfirmed lock as
+                            // unspent: after a restart (the lock phase permit is in memory only)
+                            // or a hold that ran out, this lock could double spend another swap's
+                            // and be rejected forever. Nothing is built or relayed yet: wait for
+                            // that spend to confirm, then build again.
+                            if !monero_wallet
+                                .tx_inputs_unspent(&xmr_lock_tx)
+                                .await
+                                .context("Failed to check the Monero lock's inputs with the daemon")
+                                .map_err(backoff::Error::transient)?
+                            {
+                                return Ok(LockRound::WaitingForChange(anyhow::anyhow!(
+                                    "The Monero lock selected inputs that a transaction in the daemon's pool or chain already spends"
+                                )));
+                            }
+
                             let tx_key = receipt.tx_keys.get(&lock_address.to_string()).expect("monero-sys guarantees that the address has a valid tx key or the tx isn't published");
 
                             Ok(LockRound::Built(
@@ -1654,12 +1671,12 @@ enum LockFunding {
 ///   10-block lock, 43.51 XMR unlocked for 58.66 XMR needed, 58.91 XMR in total).
 ///
 /// The wallet is refreshed first: a stale balance let swap 5eabdea8 pass this check on
-/// 26/08/2026. This is still a balance check, not an output check: only asking the daemon
-/// about the lock's key images would prove its inputs unspent. The unlocked balance is the
-/// main account's (index 0) only, the one the lock spends from: monero-sys builds it with
-/// `subaddr_account` 0. The total spans every account: Monero outside account 0 only delays
-/// the same early refund. The refresh and the reads are bounded by
-/// [`FUNDABILITY_CHECK_TIMEOUT`], so a slow daemon means a retry, not a stalled swap that
+/// 26/08/2026. This is still a balance check, not an output check: the lock built after it is
+/// checked against the daemon's key images ([`monero::Wallets::tx_inputs_unspent`]). The
+/// unlocked balance is the main account's (index 0) only, the one the lock spends from:
+/// monero-sys builds it with `subaddr_account` 0. The total spans every account: Monero
+/// outside account 0 only delays the same early refund. The refresh and the reads are bounded
+/// by [`FUNDABILITY_CHECK_TIMEOUT`], so a slow daemon means a retry, not a stalled swap that
 /// keeps the lock phase permit.
 async fn check_lock_funding(
     monero_wallet: &monero::Wallets,
@@ -1790,8 +1807,9 @@ async fn lock_phase_hold_expired(
 /// holding a constructed or relayed lock transaction. If the daemon knows that transaction,
 /// scan it into wallet2: once it is in a block, this marks its outputs spent before the next
 /// swap constructs. A lock still in the mempool gains nothing from the scan (wallet2 only
-/// marks outputs spent from a block), so the unserialized race returns for this one wedged
-/// swap. Bounded so an unresponsive daemon cannot extend the hold.
+/// marks outputs spent from a block); the next swap's lock is then checked against the
+/// daemon's key images before it is used ([`monero::Wallets::tx_inputs_unspent`], 12/11/2026).
+/// Bounded so an unresponsive daemon cannot extend the hold.
 async fn abandon_lock_phase(state: &AliceState, monero_wallet: &monero::Wallets) {
     let tx_hash = match state {
         AliceState::XmrLockTransactionConstructed { xmr_lock_tx, .. } => {
