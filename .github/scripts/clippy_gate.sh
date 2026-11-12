@@ -6,9 +6,9 @@
 # fork changed (as on 4.15). This lints the fork (HEAD) and then pristine 5.0.3 in the same
 # checkout, both with --cap-lints warn (every crate is linted, nothing stops the build), with
 # default features and then with all features, and hands both outputs to clippy_gate.py: a
-# finding (lint or hard error) the base has at the same place with the same code is upstream's
-# own; any other finding fails this step, as does a cargo failure the base does not share.
-# Results are annotations.
+# finding (lint or hard error) the base has at the same place with the same code, or in a hunk
+# the fork rewrote with the same text, is upstream's own; any other finding fails this step, as
+# does a cargo failure the base does not share. Results are annotations.
 set -uo pipefail
 base=5664a2dc2066f188ed2196a65261c61302635f38 # tag 5.0.3 (= upstream master, 10/11/2026)
 tools=$(mktemp -d)

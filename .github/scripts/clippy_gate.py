@@ -10,9 +10,10 @@ Usage: clippy_gate.py <head.jsonl> <head exit> <base.jsonl> <base exit> <base_sh
 Each finding of HEAD (lint warning or hard error) is matched with the base's findings after
 mapping the base's line numbers through `git diff base HEAD`: one the base has at the same place
 (file, line, column) with the same lint or error code is upstream's own (it fails upstream's CI
-the same way); any other is new with the fork's diff and fails the step. Results are published
-as annotations, which GitHub's public check-runs API serves without a login (job logs need
-admin rights).
+the same way), and so is one the base has on a line the fork rewrote when the fork's version of
+that hunk has the same lint with the same text; any other is new with the fork's diff and fails
+the step. Results are published as annotations, which GitHub's public check-runs API serves
+without a login (job logs need admin rights).
 """
 import json
 import re
@@ -81,6 +82,22 @@ def changed(file, line, hs):
     return any(n <= line < n + nl for _o, _ol, n, nl in hs.get(file, []))
 
 
+def hunk_of_new(file, line, hs):
+    """Index of the fork's hunk holding HEAD line `line`, None if the line is unchanged."""
+    for i, (_o, _ol, n, nl) in enumerate(hs.get(file, [])):
+        if n <= line < n + nl:
+            return i
+    return None
+
+
+def hunk_of_old(file, line, hs):
+    """Index of the fork's hunk that replaced base line `line`, None if it is unchanged."""
+    for i, (o, ol, _n, _nl) in enumerate(hs.get(file, [])):
+        if ol and o <= line < o + ol:
+            return i
+    return None
+
+
 def map_old(file, line, hs):
     """Line number in HEAD of an unchanged base line, None if the fork changed that line."""
     shift = 0
@@ -110,7 +127,10 @@ def main():
     hs = hunks(base)
     # Matched on place and code, not on the text: a count in the text may move with the fork
     # (e.g. too_many_arguments "(10/7)" where 5.0.3 says "(9/7)" for the same function).
-    mapped = {}
+    # A finding 5.0.3 has on a line the fork rewrote (e.g. a signature it made generic) is
+    # upstream's own too when the fork's version of that hunk has the same lint with the same
+    # text, counted one for one: (file, hunk, code, text) -> how many 5.0.3 has there.
+    mapped, in_hunk = {}, {}
     for (f, ln, col, code, text) in basef:
         if f == '-':
             mapped[('-', 0, 0, code, text)] = text
@@ -118,13 +138,21 @@ def main():
         new = map_old(f, ln, hs)
         if new is not None:
             mapped[(f, new, col, code)] = text
+        else:
+            k = (f, hunk_of_old(f, ln, hs), code, text)
+            in_hunk[k] = in_hunk.get(k, 0) + 1
     ours, upstream, by_code = [], [], {}
     for key in sorted(head):
         f, ln, col, code, text = key
         line = f'{f}:{ln}:{col}: {code}: {text}'
         base_text = mapped.get(key) if f == '-' else mapped.get((f, ln, col, code))
+        hk = (f, hunk_of_new(f, ln, hs), code, text)
         if base_text is not None:
             upstream.append(line + ('' if base_text == text else f'   [5.0.3: {base_text}]'))
+            by_code[code] = by_code.get(code, 0) + 1
+        elif f != '-' and hk[1] is not None and in_hunk.get(hk, 0) > 0:
+            in_hunk[hk] -= 1
+            upstream.append(line + '   [5.0.3 has it in the hunk the fork rewrote, same text]')
             by_code[code] = by_code.get(code, 0) + 1
         elif f == '-':
             ours.append(line + '   [no location]')
