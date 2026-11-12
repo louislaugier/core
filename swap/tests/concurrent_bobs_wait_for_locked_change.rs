@@ -17,11 +17,16 @@ async fn concurrent_bobs_wait_for_locked_change() {
         let (bob_swap_1, bob_join_handle_1) = ctx.bob_swap().await;
         let bob_swap_1 = tokio::spawn(bob::run(bob_swap_1));
         let alice_swap_1 = ctx.alice_next_swap().await;
-        let alice_swap_1 = tokio::spawn(alice::run(alice_swap_1, FixedRate::default()));
 
+        // Both setups complete before either maker swap runs (12/11/2026). A running maker swap
+        // reserves its Monero once it sees the taker's Bitcoin lock, and the setup check leaves
+        // reserved Monero out (cd67bc26): a second setup after that point is a race the test
+        // must not depend on.
         let (bob_swap_2, bob_join_handle_2) = ctx.bob_swap().await;
         let bob_swap_2 = tokio::spawn(bob::run(bob_swap_2));
         let alice_swap_2 = ctx.alice_next_swap().await;
+
+        let alice_swap_1 = tokio::spawn(alice::run(alice_swap_1, FixedRate::default()));
         let alice_swap_2 = tokio::spawn(alice::run(alice_swap_2, FixedRate::default()));
 
         let bob_state_1 = bob_swap_1.await??;
