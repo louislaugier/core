@@ -34,3 +34,5 @@ jobs:
           flood_decode_tests asb::event_loop::tests
       - name: The fork's env defaults
         run: cargo test --package swap-env --test trusted_daemon_config
+      - name: The fork's key-image check of a built lock (monero-wallet)
+        run: cargo test --package monero-wallet --lib -- wallets::tests
