@@ -1042,6 +1042,7 @@ where
     ) -> BoxFuture<'static, Result<Arc<BidQuote>, Arc<anyhow::Error>>> {
         let quote_cache = self.quote_cache.clone();
         let rate = self.latest_rate.clone();
+        let spread_source = self.latest_rate.clone();
         let db = self.db.clone();
         let monero_wallet = self.monero_wallet.clone();
         let monero_wallet_for_proof = self.monero_wallet.clone();
@@ -1062,6 +1063,10 @@ where
 
             // We have a cache miss, so we compute a new quote
             tracing::trace!("Got a request for a quote, computing new quote.");
+
+            // The spread this quote is priced with, to tell whether a hot reload of
+            // `ask_spread` lands while it is computed (fork, see the insert below).
+            let spread_at_start = spread_source.current_ask_spread();
 
             let get_reserved_items = || async {
                 let all_swaps = db.all().await?;
@@ -1116,7 +1121,18 @@ where
 
             // Insert the computed quote into the cache
             // Need to clone it as insert takes ownership
-            quote_cache.insert(key, result.clone());
+            //
+            // Fork (12/11/2026): unless `ask_spread` was hot-reloaded while it was computed. The
+            // reload empties the cache, but a computation already in flight would put a quote
+            // at the old spread back, served for up to `QUOTE_CACHE_TTL`. It still answers the
+            // requests that started it; the next one computes at the new spread.
+            if spread_source.current_ask_spread() == spread_at_start {
+                quote_cache.insert(key, result.clone());
+            } else {
+                tracing::debug!(
+                    "ask_spread was reloaded while this quote was computed; not caching it"
+                );
+            }
 
             // If the quote failed, we log the error
             if let Err(err) = &result {
