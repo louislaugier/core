@@ -29,9 +29,9 @@ use moka::{future::Cache as AsyncCache, sync::Cache};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hash;
 use std::convert::TryInto;
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -962,14 +962,6 @@ where
         }
     }
 
-    /// Start a quote computation if none is currently in flight.
-    ///
-    /// The `inflight_quote_computation` stream always contains a permanent
-    /// `pending()` keep-alive future, so `len() == 1` means no real
-    /// computation is running. Called by every site that queues a
-    /// consumer for the next quote result (p2p quote protocol, controller
-    /// RPC) to guarantee there is a future that will eventually wake up
-    /// the result-draining select arm.
     /// Flags `peer` as a flood peer and drops its connections (fork, 07/10/2026).
     ///
     /// One `trace!` per drop on [`FLOOD_LOG_TARGET`]: the js-libp2p bot opens thousands of
@@ -991,6 +983,14 @@ where
         self.flood_peers.contains(peer, Instant::now())
     }
 
+    /// Start a quote computation if none is currently in flight.
+    ///
+    /// The `inflight_quote_computation` stream always contains a permanent
+    /// `pending()` keep-alive future, so `len() == 1` means no real
+    /// computation is running. Called by every site that queues a
+    /// consumer for the next quote result (p2p quote protocol, controller
+    /// RPC) to guarantee there is a future that will eventually wake up
+    /// the result-draining select arm.
     fn ensure_quote_computation_is_inflight(&mut self) {
         if self.inflight_quote_computation.len() == 1 {
             self.inflight_quote_computation
@@ -1378,7 +1378,6 @@ where
         Ok(())
     }
 
-    /// Change `maker.external_bitcoin_redeem_address` both in-memory and
     /// Hot-reload `maker.ask_spread` when config.toml changes on disk.
     ///
     /// Operators retune the spread several times a day; restarting the maker
@@ -1431,6 +1430,7 @@ where
         );
     }
 
+    /// Change `maker.external_bitcoin_redeem_address` both in-memory and
     /// on disk. Applies only to swaps started _afterwards_.
     ///
     /// Uses `toml_edit` so the on-disk edit is minimal: comments,
