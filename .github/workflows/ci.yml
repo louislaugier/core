@@ -150,19 +150,26 @@ jobs:
         run: bash .github/scripts/annotate.sh cargo test --lib --no-fail-fast
 
       # The other tests of the swap binary are outdated
+      # fork (12/11/2026): the steps below run even when the library tests fail. Those fail on
+      # 5.0.3 itself (baseline_lib_tests), which upstream's CI lets skip every step after them.
       - name: Run swap binary fee test
+        if: ${{ !cancelled() }} # fork: also after a failed step above
         run: bash .github/scripts/annotate.sh cargo test --package swap --bin swap swap_fee_excludes_funds_outside_the_input_limit
 
       - name: Run Monero conflict tests
+        if: ${{ !cancelled() }} # fork: also after a failed step above
         run: bash .github/scripts/annotate.sh cargo test --package monero-tests --test double_spend
 
       - name: Run Monero construction throttle tests
+        if: ${{ !cancelled() }} # fork: also after a failed step above
         run: bash .github/scripts/annotate.sh cargo test --manifest-path monero-wallet/Cargo.toml --test construction_throttle
 
       - name: Run maker fee config tests
+        if: ${{ !cancelled() }} # fork: also after a failed step above
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test maker_fee_config
 
       - name: Run env config tests (fork, 40 min mainnet lock retry window)
+        if: ${{ !cancelled() }} # fork: also after a failed step above
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
 
   # fork (12/11/2026): upstream's CI fails "Run library tests" on 5.0.3 itself (run 42796064507,
