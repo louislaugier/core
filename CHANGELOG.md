@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fork: what louislaugier/core carries on top of 5.0.3 (branch `port/5.0.3-hot12`, image
+  branch `ci/5.0.3-hot12`):
+  - ASB: Only one swap at a time is in the Monero lock phase,
+    from output selection (`XmrReadyToLock`) to the lock's first confirmation.
+    wallet2 does not count a relayed lock's inputs as spent,
+    and the construction cooldown only spaces constructions out.
+    A swap holds the phase for at most 20 minutes at a time:
+    past that it queues again if it has not built its lock yet,
+    and continues on its own only once the lock is built.
+  - ASB: A lock our wallet can fund only once our own locked change unlocks waits for it,
+    out of the lock phase, for up to `monero_lock_retry_timeout` (40 minutes on mainnet).
+    A swap the whole wallet cannot fund refunds the Bitcoin early before building a lock.
+  - ASB: A swap setup leaves out the Monero that swaps in flight reserved.
+  - ASB: `maker.ask_spread` is reloaded from config.toml without a restart.
+  - ASB: Up to 12 connections per peer (4 upstream), and every pending quote request is answered.
+  - ASB: Identify never shares listen addresses, only the configured external addresses.
+  - ASB: The published quote max is 1 % under the balance the wallet can lock.
+  - ASB: js-libp2p flood connections are dropped on identify, peers whose swap setup does not
+    decode are refused for 10 minutes, and flood lines stay out of the logs.
+  - CLI: New `list-sellers` subcommand (and `buy-xmr` on `port/5.0.3-cli-buyxmr`).
+  - CI: `build-asb-mutex` builds the ASB image on GHCR for `ci/**` branches,
+    `fork-unit-tests` runs the fork's unit tests.
+
 ## [5.0.3] - 2026-11-10
 
 - GUI + CLI + ASB: Fix the built-in Tor client staying at 15% during startup on Windows.
