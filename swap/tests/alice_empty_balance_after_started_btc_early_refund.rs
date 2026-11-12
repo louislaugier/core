@@ -69,9 +69,12 @@ async fn alice_zero_xmr_refunds_bitcoin() {
 
         let bob_state = bob_swap.await??;
 
-        assert!(
-            alice_turns >= 2,
-            "Alice must requeue after her first turn expires"
+        // Our fork checks that the wallet can fund the lock before Alice queues for a
+        // construction turn, so an empty wallet refunds at once instead of spending turns
+        // until `monero_lock_retry_timeout`.
+        assert_eq!(
+            alice_turns, 0,
+            "Alice must refund without taking a construction turn when her wallet is empty"
         );
         assert!(matches!(alice_state, AliceState::BtcEarlyRefunded(_)));
         assert!(matches!(bob_state, BobState::BtcEarlyRefunded(_)));
