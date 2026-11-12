@@ -1295,10 +1295,20 @@ impl ReservesMonero for AliceState {
             AliceState::Started { .. } => monero::Amount::ZERO,
             // These are the only states where we have to assume we will have to lock
             // our Monero, and we haven't done so yet.
+            //
+            // Fork (12/11/2026): `XmrLockTransactionSent` too. wallet2 marks the lock's inputs
+            // spent only once the lock is in a block (it skips `set_spent` for pool
+            // transactions), so until then the unlocked balance still counts them. Without
+            // this, the quote and the swap setup check offered that Monero to another swap
+            // from the relay until the confirmation (about 2 min, plus the setup snapshot's
+            // cache), and that swap was refunded early at lock time. Once the block is
+            // processed the amount is counted twice until the swap moves to `XmrLocked` (one
+            // confirmation poll): the safe side.
             AliceState::BtcLockTransactionSeen { state3 }
             | AliceState::BtcLocked { state3 }
             | AliceState::XmrReadyToLock { state3, .. }
-            | AliceState::XmrLockTransactionConstructed { state3, .. } => {
+            | AliceState::XmrLockTransactionConstructed { state3, .. }
+            | AliceState::XmrLockTransactionSent { state3, .. } => {
                 // We reserve as much Monero as we need for the output of the lock transaction
                 // and as we need for the network fee
                 state3.xmr.min_conservative_balance_to_spend()
