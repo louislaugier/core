@@ -39,6 +39,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           file: swap-asb/Dockerfile
@@ -49,3 +50,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # fork (12/11/2026): the pushed image and its digest as an annotation, readable through the
+      # public check-runs API (job logs need a login)
+      - name: publish the image reference
+        run: >-
+          echo "::notice title=image::ghcr.io/louislaugier/eigenwallet-asb:${{ steps.v.outputs.ver
+          }}-full1193-${{ steps.v.outputs.suffix }}@${{ steps.build.outputs.digest }}"

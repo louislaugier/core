@@ -27,12 +27,15 @@ jobs:
         uses: ./.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
+      # annotate.sh (ci branches only): a failure publishes its errors and panics as annotations,
+      # readable without a login (12/11/2026)
       - name: Unit tests of the fork's lock, setup, flood and quote changes
         run: >-
+          bash .github/scripts/annotate.sh
           cargo test --package swap --lib --
           lock_phase unlock_wait_tests setup_reserve_tests flood_agent_tests
           flood_decode_tests asb::event_loop::tests
       - name: The fork's env defaults
-        run: cargo test --package swap-env --test trusted_daemon_config
+        run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
       - name: The fork's key-image check of a built lock (monero-wallet)
-        run: cargo test --package monero-wallet --lib -- wallets::tests
+        run: bash .github/scripts/annotate.sh cargo test --package monero-wallet --lib -- wallets::tests

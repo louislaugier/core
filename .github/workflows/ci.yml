@@ -17,11 +17,25 @@ jobs:
     if: github.event_name == 'push' || !github.event.pull_request.draft
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fork: the clippy gate lints pristine 5.0.3 too
+
+      - name: Free runner disk (fork, the gate keeps two trees' clippy output)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
 
       - name: Setup build environment (cli tools, dependencies)
         uses: ./.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
+
+      # fork (12/11/2026): upstream's clippy step fails on 5.0.3 itself and stops at the first
+      # crate with a finding, before the crates the fork changed. This lints every crate of the
+      # fork and of pristine 5.0.3 (--cap-lints warn, default and all features) and fails only on
+      # findings that 5.0.3 does not have at the same place (see .github/scripts/clippy_gate.py).
+      - name: Clippy gate (fork) - every crate, the fork against pristine 5.0.3
+        run: bash .github/scripts/clippy_gate.sh
 
       - name: Run clippy with default features
         run: bash .github/scripts/annotate.sh cargo clippy --workspace --all-targets -- -D warnings
@@ -151,6 +165,32 @@ jobs:
       - name: Run env config tests (fork, 40 min mainnet lock retry window)
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
 
+  # fork (12/11/2026): upstream's CI fails "Run library tests" on 5.0.3 itself (run 42796064507,
+  # ubuntu and macos). The same command on pristine 5.0.3, published as annotations, so each
+  # failing test of the fork's run can be checked against upstream's own. Never fails the run.
+  baseline_lib_tests:
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out pristine 5.0.3, keeping the fork's annotate.sh
+        run: |
+          cp .github/scripts/annotate.sh "$RUNNER_TEMP/annotate.sh"
+          git checkout --force 5664a2dc2066f188ed2196a65261c61302635f38
+          git log -1 --format='%H %s'
+
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+
+      - name: Library tests on pristine 5.0.3 (upstream baseline)
+        continue-on-error: true
+        run: bash "$RUNNER_TEMP/annotate.sh" cargo test --lib --no-fail-fast
+
   docker_tests:
     strategy:
       fail-fast: false
@@ -202,19 +242,22 @@ jobs:
             test_name: happy_path_bob_recovers_swap_from_apollo
           - package: swap
             test_name: happy_path_bob_recovers_swap_from_apollo_after_alice_redeemed
+          # fork: 90 min, not 45 (upstream's own run 42796064507 lost
+          # concurrent_bobs_before_xmr_lock_proof_sent to the 45 min job timeout, ~30 of which
+          # go to the build); the fork's lock phase also serializes the two swaps' Monero locks
           - package: swap
             test_name: concurrent_bobs_before_xmr_lock_proof_sent
-            timeout_minutes: 45
+            timeout_minutes: 90
           - package: swap
             test_name: concurrent_bobs_after_xmr_lock_proof_sent
-            timeout_minutes: 45
+            timeout_minutes: 90
           # fork: the serialized Monero lock phase and the wait for our locked change
           - package: swap
             test_name: concurrent_bobs_insufficient_xmr
-            timeout_minutes: 60
+            timeout_minutes: 90
           - package: swap
             test_name: concurrent_bobs_wait_for_locked_change
-            timeout_minutes: 60
+            timeout_minutes: 90
           - package: swap
             test_name: alice_cancels_while_waiting_for_xmr_construction_turn
           - package: swap
