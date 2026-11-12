@@ -483,8 +483,7 @@ where
                                     .await
                                     .unlocked_balance()
                                     .await
-                                    .context("Failed to read the unlocked Monero balance for the swap setup")?
-                                    .into();
+                                    .context("Failed to read the unlocked Monero balance for the swap setup")?;
                                 let wallet_state = WalletSnapshotState {
                                     unlocked_balance: unreserved_balance(unlocked_balance, reserved),
                                     ..wallet_state
@@ -719,10 +718,10 @@ where
                             // Fork (07/10/2026): a js-libp2p bot floods us with swap setups it
                             // aborts, from a fresh peer id per connection, so per-peer bans miss
                             // it. Its identify agent gives it away: drop the connection there.
-                            if let libp2p::identify::Event::Received { peer_id, info, .. } = &*identify_event {
-                                if is_flood_agent(&info.agent_version) {
-                                    self.drop_flood_peer(*peer_id, &info.agent_version);
-                                }
+                            if let libp2p::identify::Event::Received { peer_id, info, .. } = &*identify_event
+                                && is_flood_agent(&info.agent_version)
+                            {
+                                self.drop_flood_peer(*peer_id, &info.agent_version);
                             }
                         }
                         SwarmEvent::NewListenAddr{address, .. } => {
@@ -2606,8 +2605,7 @@ mod flood_decode_tests {
     #[test]
     fn a_bare_map_request_flags_its_peer() {
         let error = decode_cbor_message::<SpotPriceRequest>(&BARE_MAP)
-            .err()
-            .expect("a bare map is not a v4 message");
+            .expect_err("a bare map is not a v4 message");
         // The swap setup behaviour hands the handler's error on as `anyhow!(error)`.
         let error = anyhow!(spot_price_read_error(error));
 
@@ -2641,8 +2639,7 @@ mod flood_decode_tests {
             .recv()
             .await
             .context(SetupEndedEarly)
-            .err()
-            .expect("no setup is left to ask");
+            .expect_err("no setup is left to ask");
 
         assert!(error.is::<SetupEndedEarly>());
     }
