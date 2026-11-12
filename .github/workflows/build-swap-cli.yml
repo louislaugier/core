@@ -26,8 +26,10 @@ jobs:
       - uses: ./.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
+      # annotate.sh (fork CI, 12/11/2026): a failed build publishes its errors as annotations,
+      # readable without a login (job logs are not)
       - name: build swap (release)
-        run: cargo build --bin swap --release
+        run: bash .github/scripts/annotate.sh cargo build --bin swap --release
       - name: smoke test + package
         run: |
           set -euo pipefail
@@ -40,9 +42,15 @@ jobs:
           tar -C target/release -cf "swap-cli-${ver}-${suffix}.tar" swap
           sha256sum "swap-cli-${ver}-${suffix}.tar"
           echo "TAG=cli-${ver}-${suffix}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          # fork (12/11/2026): the release tag, the asset's sha256 and the smoke test's version
+          echo "::notice title=swap-cli::tag cli-${ver}-${suffix}-${GITHUB_RUN_NUMBER} commit ${GITHUB_SHA} sha256 $(sha256sum "swap-cli-${ver}-${suffix}.tar" | cut -d' ' -f1) version $($B --version | tr -d '\n')"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           name: ${{ env.TAG }}
+          # fork (12/11/2026): tag the commit that was built; without it the new tag was created
+          # on the default branch (cli-5.0.3-ci-5.0.3-cli-buyxmr-3 points at an August commit)
+          target_commitish: ${{ github.sha }}
+          body: "swap CLI built from ${{ github.ref_name }} @ ${{ github.sha }} (fork CI run ${{ github.run_id }})"
           prerelease: true
           files: swap-cli-*.tar
