@@ -64,6 +64,32 @@ pub async fn setup_test<T, F, C>(
         developer_tip_ratio,
         refund_policy,
         BobBitcoinFunding::OnChain,
+        DEFAULT_ALICE_XMR_OUTPUTS,
+        testfn,
+    )
+    .await;
+}
+
+/// [`setup_test`] with the maker's Monero split into `alice_xmr_outputs` outputs of the swap
+/// amount each (fork): constrains how much unlocked XMR Alice holds, e.g. two outputs fund only
+/// one of two concurrent swaps.
+pub async fn setup_test_funded<T, F, C>(
+    config: C,
+    developer_tip_ratio: Option<(Decimal, bool)>,
+    refund_policy: Option<RefundPolicy>,
+    alice_xmr_outputs: u64,
+    testfn: T,
+) where
+    T: Fn(TestContext) -> F,
+    F: Future<Output = Result<()>>,
+    C: GetConfig,
+{
+    setup_test_with_bob_funding(
+        config,
+        developer_tip_ratio,
+        refund_policy,
+        BobBitcoinFunding::OnChain,
+        alice_xmr_outputs,
         testfn,
     )
     .await;
@@ -84,10 +110,14 @@ pub async fn setup_test_with_fake_bob_bitcoin_utxo<T, F, C>(
         developer_tip_ratio,
         refund_policy,
         BobBitcoinFunding::Fake,
+        DEFAULT_ALICE_XMR_OUTPUTS,
         testfn,
     )
     .await;
 }
+
+/// The maker's default Monero balance: ten outputs of the swap amount (1 XMR) each.
+const DEFAULT_ALICE_XMR_OUTPUTS: u64 = 10;
 
 #[derive(Clone, Copy)]
 enum BobBitcoinFunding {
@@ -100,6 +130,7 @@ async fn setup_test_with_bob_funding<T, F, C>(
     developer_tip_ratio: Option<(Decimal, bool)>,
     refund_policy: Option<RefundPolicy>,
     bob_bitcoin_funding: BobBitcoinFunding,
+    alice_xmr_outputs: u64,
     testfn: T,
 ) where
     T: Fn(TestContext) -> F,
@@ -175,7 +206,7 @@ async fn setup_test_with_bob_funding<T, F, C>(
     };
 
     let alice_starting_balances =
-        StartingBalances::new(bitcoin::Amount::ZERO, xmr_amount, Some(10));
+        StartingBalances::new(bitcoin::Amount::ZERO, xmr_amount, Some(alice_xmr_outputs));
     let alice_seed = Seed::random().unwrap();
     let alice_db_path = NamedTempFile::new().unwrap().path().to_path_buf();
     let alice_config_path = alice_db_path.with_extension("config.toml");
