@@ -306,14 +306,17 @@ where
             // capped to end inside one hold: the retry budget stops new attempts, the timeout
             // ends the attempt still running. Fork: one step is one round. A round that builds
             // nothing while `monero_lock_retry_timeout` (counted from the first round, see
-            // `run_until`) is not over hands `XmrReadyToLock` back, and the swap queues again.
-            // `run_until` always passes when the first round began; without it the window
-            // counts as over (one round, then the failure path, as upstream after its retry).
+            // `run_until`) is not over hands `XmrReadyToLock` back, and the swap queues again;
+            // a round that waits for our locked change does so while the cancel timelock leaves
+            // room ([`change_wait_allowed`]). `run_until` always passes when the first round
+            // began; without it the window counts as over (one round, then the failure path,
+            // as upstream after its retry).
             let lock_retry_elapsed =
                 move || ready_to_lock_since.map_or(Duration::MAX, |since| since.elapsed());
-            let construction_budget =
-                lock_retry_left(env_config.monero_lock_retry_timeout, lock_retry_elapsed())
-                    .min(LOCK_CONSTRUCTION_BUDGET);
+            let construction_budget = round_construction_budget(lock_retry_left(
+                env_config.monero_lock_retry_timeout,
+                lock_retry_elapsed(),
+            ));
 
             let constructed = tokio::select! {
                 biased;
@@ -383,6 +386,23 @@ where
                                 .context("Failed to construct Monero lock transaction")
                                 .map_err(backoff::Error::transient)?;
 
+                            // Fork (12/11/2026): ask the daemon about the inputs wallet2 picked.
+                            // wallet2 still counts the inputs of a relayed, unconfirmed lock as
+                            // unspent: after a restart (the lock phase permit is in memory only)
+                            // or a hold that ran out, this lock could double spend another swap's
+                            // and be rejected forever. Nothing is built or relayed yet: wait for
+                            // that spend to confirm, then build again.
+                            if !monero_wallet
+                                .tx_inputs_unspent(&xmr_lock_tx)
+                                .await
+                                .context("Failed to check the Monero lock's inputs with the daemon")
+                                .map_err(backoff::Error::transient)?
+                            {
+                                return Ok(LockRound::WaitingForChange(anyhow::anyhow!(
+                                    "The Monero lock selected inputs that a transaction in the daemon's pool or chain already spends"
+                                )));
+                            }
+
                             let tx_key = receipt.tx_keys.get(&lock_address.to_string()).expect("monero-sys guarantees that the address has a valid tx key or the tx isn't published");
 
                             Ok(LockRound::Built(
@@ -402,6 +422,27 @@ where
                     .map(Some),
             };
 
+            // Fork: whether a round that built no lock queues again. A construction that kept
+            // failing does while `monero_lock_retry_timeout` is open. A wait for our own locked
+            // change (or for a conflicting spend to confirm) does while the Bitcoin cancel
+            // timelock leaves room to finish the swap (12/11/2026): when swaps chain on each
+            // other's change, each link costs about 22 min, so the third one outlived the window
+            // although the wallet could fund it.
+            let window_open =
+                !lock_retry_left(env_config.monero_lock_retry_timeout, lock_retry_elapsed())
+                    .is_zero();
+            let waiting_for_change =
+                matches!(constructed, Ok(Some(LockRound::WaitingForChange(_))));
+            let queue_again = if waiting_for_change {
+                change_wait_allowed(
+                    state3.expired_timelocks(&*bitcoin_wallet).await,
+                    u32::from(state3.cancel_timelock),
+                    window_open,
+                )
+            } else {
+                constructed.is_err() && window_open
+            };
+
             match constructed {
                 // If the construction was successful, we transition to the next state
                 Ok(Some(LockRound::Built(transfer_proof, xmr_lock_tx))) => {
@@ -412,17 +453,11 @@ where
                         state3,
                     }
                 }
-                // Fork: no lock in this round, but the retry window is still open. Hand
+                // Fork: no lock in this round, but the swap may still wait (`queue_again`). Hand
                 // `XmrReadyToLock` back: `run_until` lets the swaps queued behind this one take
                 // the lock phase, then queues it again. Waiting for our own locked change
                 // (05/10/2026) or a construction that kept failing for a whole round.
-                Ok(Some(LockRound::WaitingForChange(error))) | Err(error)
-                    if !lock_retry_left(
-                        env_config.monero_lock_retry_timeout,
-                        lock_retry_elapsed(),
-                    )
-                    .is_zero() =>
-                {
+                Ok(Some(LockRound::WaitingForChange(error))) | Err(error) if queue_again => {
                     tracing::info!(
                         swap_id = %swap_id,
                         error = %format!("{error:#}"),
@@ -1622,8 +1657,11 @@ enum LockRound {
     /// The lock is built: on to `XmrLockTransactionConstructed`.
     Built(TransferProof, Transaction<NotPruned>),
     /// The wallet can fund the lock only once our own locked change unlocks
-    /// ([`LockFunding::AfterOurChangeUnlocks`]). The swap queues again while the retry window
-    /// is open, instead of holding the lock phase or refunding.
+    /// ([`LockFunding::AfterOurChangeUnlocks`]), or the lock just built picked inputs that a
+    /// transaction in the daemon's pool or chain already spends
+    /// ([`monero::Wallets::tx_inputs_unspent`]). The swap queues again while the cancel
+    /// timelock leaves room ([`change_wait_allowed`]), instead of holding the lock phase or
+    /// refunding.
     WaitingForChange(anyhow::Error),
     /// The lock cannot be built (the shared wallet is not empty, the wallet cannot fund it
     /// at all, the destinations are invalid): the failure path decides the recovery.
@@ -1654,12 +1692,12 @@ enum LockFunding {
 ///   10-block lock, 43.51 XMR unlocked for 58.66 XMR needed, 58.91 XMR in total).
 ///
 /// The wallet is refreshed first: a stale balance let swap 5eabdea8 pass this check on
-/// 26/08/2026. This is still a balance check, not an output check: only asking the daemon
-/// about the lock's key images would prove its inputs unspent. The unlocked balance is the
-/// main account's (index 0) only, the one the lock spends from: monero-sys builds it with
-/// `subaddr_account` 0. The total spans every account: Monero outside account 0 only delays
-/// the same early refund. The refresh and the reads are bounded by
-/// [`FUNDABILITY_CHECK_TIMEOUT`], so a slow daemon means a retry, not a stalled swap that
+/// 26/08/2026. This is still a balance check, not an output check: the lock built after it is
+/// checked against the daemon's key images ([`monero::Wallets::tx_inputs_unspent`]). The
+/// unlocked balance is the main account's (index 0) only, the one the lock spends from:
+/// monero-sys builds it with `subaddr_account` 0. The total spans every account: Monero
+/// outside account 0 only delays the same early refund. The refresh and the reads are bounded
+/// by [`FUNDABILITY_CHECK_TIMEOUT`], so a slow daemon means a retry, not a stalled swap that
 /// keeps the lock phase permit.
 async fn check_lock_funding(
     monero_wallet: &monero::Wallets,
@@ -1747,6 +1785,48 @@ fn lock_requeue_pause(env_config: &Config) -> Duration {
     env_config.monero_avg_block_time / 2
 }
 
+/// Retry budget of one `XmrReadyToLock` construction round (fork): what is left of
+/// `monero_lock_retry_timeout`, at most [`LOCK_CONSTRUCTION_BUDGET`]. A round that starts with
+/// the window over only exists for a swap that kept waiting for our locked change past it
+/// ([`change_wait_allowed`]): it gets a whole round, so that a single transient error right
+/// after the change unlocks does not refund a swap that waited that long (12/11/2026).
+fn round_construction_budget(retry_left: Duration) -> Duration {
+    if retry_left.is_zero() {
+        LOCK_CONSTRUCTION_BUDGET
+    } else {
+        retry_left.min(LOCK_CONSTRUCTION_BUDGET)
+    }
+}
+
+/// Whether a round that waited for our own locked change, or for a conflicting spend of its
+/// inputs to confirm, may queue for the lock phase again (fork, 12/11/2026): while at least 3/5
+/// of the Bitcoin cancel timelock is left, 18 of mainnet's 30 blocks (about 3 h). The rest
+/// covers the lock's first confirmation, Bob's `monero_finality_confirmations` and his
+/// encrypted signature with a wide margin. The 40 min `monero_lock_retry_timeout` was the bound
+/// before: swaps that chain on each other's change cost about 22 min per link, so the third
+/// one was refunded early although the wallet could fund it. This bound is on chain, so a
+/// restart does not reset it either. When the timelocks cannot be read, the retry window
+/// decides.
+fn change_wait_allowed(
+    timelocks: Result<ExpiredTimelocks>,
+    cancel_timelock: u32,
+    window_open: bool,
+) -> bool {
+    match timelocks {
+        Ok(ExpiredTimelocks::None { blocks_left }) => {
+            u64::from(blocks_left) * 5 >= u64::from(cancel_timelock) * 3
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "Could not read the Bitcoin timelocks of a swap waiting to lock Monero; the retry window decides"
+            );
+            window_open
+        }
+    }
+}
+
 /// Where `state` sits in the serialized Monero lock phase (see [`MONERO_LOCK_PHASE`]).
 /// The phase starts at `XmrReadyToLock`, where upstream (since 4.15.0) selects the outputs
 /// and builds the lock ([`PhaseStep::Selecting`]: nothing built or published yet).
@@ -1790,8 +1870,9 @@ async fn lock_phase_hold_expired(
 /// holding a constructed or relayed lock transaction. If the daemon knows that transaction,
 /// scan it into wallet2: once it is in a block, this marks its outputs spent before the next
 /// swap constructs. A lock still in the mempool gains nothing from the scan (wallet2 only
-/// marks outputs spent from a block), so the unserialized race returns for this one wedged
-/// swap. Bounded so an unresponsive daemon cannot extend the hold.
+/// marks outputs spent from a block); the next swap's lock is then checked against the
+/// daemon's key images before it is used ([`monero::Wallets::tx_inputs_unspent`], 12/11/2026).
+/// Bounded so an unresponsive daemon cannot extend the hold.
 async fn abandon_lock_phase(state: &AliceState, monero_wallet: &monero::Wallets) {
     let tx_hash = match state {
         AliceState::XmrLockTransactionConstructed { xmr_lock_tx, .. } => {
@@ -1828,8 +1909,12 @@ async fn abandon_lock_phase(state: &AliceState, monero_wallet: &monero::Wallets)
 
 #[cfg(test)]
 mod unlock_wait_tests {
-    use super::{lock_requeue_pause, lock_retry_left, waits_for_unlock};
+    use super::{
+        LOCK_CONSTRUCTION_BUDGET, change_wait_allowed, lock_requeue_pause, lock_retry_left,
+        round_construction_budget, waits_for_unlock,
+    };
     use std::time::Duration;
+    use swap_core::bitcoin::ExpiredTimelocks;
     use swap_env::env::{GetConfig, Mainnet};
 
     /// 05/10/2026, swap 6662ebc5: 43.51 XMR unlocked, 58.91 XMR in total, 58.66 XMR needed.
@@ -1873,6 +1958,63 @@ mod unlock_wait_tests {
         let mainnet = Mainnet::get_config();
         assert!(mainnet.monero_lock_retry_timeout >= mainnet.monero_avg_block_time * 20);
         assert!(lock_requeue_pause(&mainnet) * 2 <= mainnet.monero_avg_block_time);
+    }
+
+    fn blocks_left(blocks_left: u32) -> anyhow::Result<ExpiredTimelocks> {
+        Ok(ExpiredTimelocks::None { blocks_left })
+    }
+
+    /// 12/11/2026: a swap waiting for our change queues again past the 40 min window while
+    /// 3/5 of the cancel timelock is left (18 of mainnet's 30 blocks), and never once it is
+    /// shorter, whatever the window says.
+    #[test]
+    fn a_change_wait_is_bounded_by_the_cancel_timelock() {
+        let cancel = Mainnet::get_config().bitcoin_cancel_timelock;
+        assert_eq!(cancel, 30);
+
+        assert!(change_wait_allowed(blocks_left(29), cancel, false));
+        assert!(change_wait_allowed(blocks_left(18), cancel, false));
+        assert!(!change_wait_allowed(blocks_left(17), cancel, true));
+        assert!(!change_wait_allowed(
+            Ok(ExpiredTimelocks::Cancel { blocks_left: 5 }),
+            cancel,
+            true
+        ));
+    }
+
+    /// Unreadable timelocks: the retry window decides, as before the fork's change wait.
+    #[test]
+    fn a_change_wait_falls_back_to_the_window_without_timelocks() {
+        let cancel = Mainnet::get_config().bitcoin_cancel_timelock;
+
+        assert!(change_wait_allowed(
+            Err(anyhow::anyhow!("no electrum")),
+            cancel,
+            true
+        ));
+        assert!(!change_wait_allowed(
+            Err(anyhow::anyhow!("no electrum")),
+            cancel,
+            false
+        ));
+    }
+
+    /// A round that starts after the window (a long change wait) gets a whole construction
+    /// round; inside the window a round gets what is left of it, at most one round.
+    #[test]
+    fn a_round_after_the_window_gets_a_whole_budget() {
+        assert_eq!(
+            round_construction_budget(Duration::ZERO),
+            LOCK_CONSTRUCTION_BUDGET
+        );
+        assert_eq!(
+            round_construction_budget(Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            round_construction_budget(Duration::from_secs(40 * 60)),
+            LOCK_CONSTRUCTION_BUDGET
+        );
     }
 }
 
