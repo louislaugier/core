@@ -1,6 +1,10 @@
 # Fork only (05/10/2026): build-asb-mutex builds the maker image but runs no test. This runs
-# the swap crate's unit tests of the Monero lock fixes (hot9: wait for locked change, hot10:
-# the setup check leaves out Monero reserved by swaps in flight) on every ci/** push.
+# the unit tests of the fork's own changes on every ci/** push (5.0.3 port, 12/11/2026):
+# the serialized Monero lock phase (lock_phase), the wait for our locked change
+# (unlock_wait_tests), the setup check that leaves out Monero reserved by swaps in flight
+# (setup_reserve_tests), the js-libp2p flood guards (flood_agent_tests, flood_decode_tests),
+# the quote tests with the 1 % max headroom (asb::event_loop::tests), and the 40 min mainnet
+# lock retry window (swap-env's trusted_daemon_config).
 name: fork-unit-tests
 on:
   push:
@@ -23,5 +27,10 @@ jobs:
         uses: ./.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
-      - name: Unit tests of the lock and setup fixes
-        run: cargo test --package swap --lib -- setup_reserve_tests
+      - name: Unit tests of the fork's lock, setup, flood and quote changes
+        run: >-
+          cargo test --package swap --lib --
+          lock_phase unlock_wait_tests setup_reserve_tests flood_agent_tests
+          flood_decode_tests asb::event_loop::tests
+      - name: The fork's env defaults
+        run: cargo test --package swap-env --test trusted_daemon_config
