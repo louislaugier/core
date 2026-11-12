@@ -37,5 +37,9 @@ jobs:
           flood_decode_tests asb::event_loop::tests
       - name: The fork's env defaults
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
+      # --manifest-path, not --package: monero-oxide's wallet crate is also named monero-wallet
+      # 0.1.0, so `-p monero-wallet` is ambiguous and cargo stops before building anything
       - name: The fork's key-image check of a built lock (monero-wallet)
-        run: bash .github/scripts/annotate.sh cargo test --package monero-wallet --lib -- wallets::tests
+        run: >-
+          bash .github/scripts/annotate.sh
+          cargo test --manifest-path monero-wallet/Cargo.toml --lib -- wallets::tests
