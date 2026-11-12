@@ -470,11 +470,26 @@ where
                                 // OUTSIDE the cached wallet state (TTL 20 s), so a reservation made
                                 // inside the TTL is never missed.
                                 let reserved = reserved_monero_in_flight(&db_for_reservations).await?;
+
+                                // Fork (12/11/2026): the unlocked balance is read fresh too, as on
+                                // 4.14, and after the reservations. A cached balance can predate a
+                                // lock's confirmation, after which that swap reserves nothing: the
+                                // setup was then checked against the Monero the lock had just
+                                // spent. Read in this order, a lock that confirms between the two
+                                // reads is counted twice (the safe side). The cache still saves the
+                                // health checks and the new Bitcoin addresses.
+                                let unlocked_balance: swap_core::monero::Amount = monero_wallet
+                                    .main_wallet()
+                                    .await
+                                    .unlocked_balance()
+                                    .await
+                                    .context("Failed to read the unlocked Monero balance for the swap setup")?
+                                    .into();
                                 let wallet_state = WalletSnapshotState {
-                                    unlocked_balance: unreserved_balance(wallet_state.unlocked_balance, reserved),
+                                    unlocked_balance: unreserved_balance(unlocked_balance, reserved),
                                     ..wallet_state
                                 };
-                                tracing::info!(%reserved, unreserved_balance = %wallet_state.unlocked_balance, "Setup balance after in-flight reservations");
+                                tracing::info!(%reserved, %unlocked_balance, unreserved_balance = %wallet_state.unlocked_balance, "Setup balance after in-flight reservations");
 
                                 let wallet_snapshot = create_wallet_snapshot(
                                     bitcoin_wallet,
@@ -1027,6 +1042,7 @@ where
     ) -> BoxFuture<'static, Result<Arc<BidQuote>, Arc<anyhow::Error>>> {
         let quote_cache = self.quote_cache.clone();
         let rate = self.latest_rate.clone();
+        let spread_source = self.latest_rate.clone();
         let db = self.db.clone();
         let monero_wallet = self.monero_wallet.clone();
         let monero_wallet_for_proof = self.monero_wallet.clone();
@@ -1047,6 +1063,10 @@ where
 
             // We have a cache miss, so we compute a new quote
             tracing::trace!("Got a request for a quote, computing new quote.");
+
+            // The spread this quote is priced with, to tell whether a hot reload of
+            // `ask_spread` lands while it is computed (fork, see the insert below).
+            let spread_at_start = spread_source.current_ask_spread();
 
             let get_reserved_items = || async {
                 let all_swaps = db.all().await?;
@@ -1101,7 +1121,18 @@ where
 
             // Insert the computed quote into the cache
             // Need to clone it as insert takes ownership
-            quote_cache.insert(key, result.clone());
+            //
+            // Fork (12/11/2026): unless `ask_spread` was hot-reloaded while it was computed. The
+            // reload empties the cache, but a computation already in flight would put a quote
+            // at the old spread back, served for up to `QUOTE_CACHE_TTL`. It still answers the
+            // requests that started it; the next one computes at the new spread.
+            if spread_source.current_ask_spread() == spread_at_start {
+                quote_cache.insert(key, result.clone());
+            } else {
+                tracing::debug!(
+                    "ask_spread was reloaded while this quote was computed; not caching it"
+                );
+            }
 
             // If the quote failed, we log the error
             if let Err(err) = &result {
@@ -1809,12 +1840,12 @@ struct WalletSnapshotState {
     punish_address: bitcoin::Address,
 }
 
-/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero is
-/// not locked yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it out,
-/// but the setup check compared the request with the raw unlocked balance, so a taker holding
-/// an older quote could be accepted against Monero another swap needs, and one of the two was
-/// refunded at lock time (fork 2739e89e0, 05/10/2026). Swaps whose Bitcoin is not seen yet
-/// reserve nothing, as for the quote: a setup alone must not freeze our liquidity.
+/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero lock
+/// is not confirmed yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it
+/// out, but the setup check compared the request with the raw unlocked balance, so a taker
+/// holding an older quote could be accepted against Monero another swap needs, and one of the
+/// two was refunded at lock time (fork 2739e89e0, 05/10/2026). Swaps whose Bitcoin is not seen
+/// yet reserve nothing, as for the quote: a setup alone must not freeze our liquidity.
 async fn reserved_monero_in_flight(
     db: &Arc<dyn Database + Send + Sync>,
 ) -> Result<swap_core::monero::Amount> {
