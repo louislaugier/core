@@ -11,6 +11,11 @@ on:
     branches:
       - 'ci/**'
   workflow_dispatch:
+# fork (12/11/2026): a newer push to the same branch cancels the run still going, as ci.yml
+# does: the image and the unit tests of the branch's latest commit are the ones that count
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   unit:
     runs-on: ubuntu-22.04
