@@ -470,11 +470,26 @@ where
                                 // OUTSIDE the cached wallet state (TTL 20 s), so a reservation made
                                 // inside the TTL is never missed.
                                 let reserved = reserved_monero_in_flight(&db_for_reservations).await?;
+
+                                // Fork (12/11/2026): the unlocked balance is read fresh too, as on
+                                // 4.14, and after the reservations. A cached balance can predate a
+                                // lock's confirmation, after which that swap reserves nothing: the
+                                // setup was then checked against the Monero the lock had just
+                                // spent. Read in this order, a lock that confirms between the two
+                                // reads is counted twice (the safe side). The cache still saves the
+                                // health checks and the new Bitcoin addresses.
+                                let unlocked_balance: swap_core::monero::Amount = monero_wallet
+                                    .main_wallet()
+                                    .await
+                                    .unlocked_balance()
+                                    .await
+                                    .context("Failed to read the unlocked Monero balance for the swap setup")?
+                                    .into();
                                 let wallet_state = WalletSnapshotState {
-                                    unlocked_balance: unreserved_balance(wallet_state.unlocked_balance, reserved),
+                                    unlocked_balance: unreserved_balance(unlocked_balance, reserved),
                                     ..wallet_state
                                 };
-                                tracing::info!(%reserved, unreserved_balance = %wallet_state.unlocked_balance, "Setup balance after in-flight reservations");
+                                tracing::info!(%reserved, %unlocked_balance, unreserved_balance = %wallet_state.unlocked_balance, "Setup balance after in-flight reservations");
 
                                 let wallet_snapshot = create_wallet_snapshot(
                                     bitcoin_wallet,
@@ -1809,12 +1824,12 @@ struct WalletSnapshotState {
     punish_address: bitcoin::Address,
 }
 
-/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero is
-/// not locked yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it out,
-/// but the setup check compared the request with the raw unlocked balance, so a taker holding
-/// an older quote could be accepted against Monero another swap needs, and one of the two was
-/// refunded at lock time (fork 2739e89e0, 05/10/2026). Swaps whose Bitcoin is not seen yet
-/// reserve nothing, as for the quote: a setup alone must not freeze our liquidity.
+/// Monero the swaps in flight already count on: their Bitcoin lock is seen and our Monero lock
+/// is not confirmed yet ([`crate::protocol::alice::ReservesMonero`]). The quote's max leaves it
+/// out, but the setup check compared the request with the raw unlocked balance, so a taker
+/// holding an older quote could be accepted against Monero another swap needs, and one of the
+/// two was refunded at lock time (fork 2739e89e0, 05/10/2026). Swaps whose Bitcoin is not seen
+/// yet reserve nothing, as for the quote: a setup alone must not freeze our liquidity.
 async fn reserved_monero_in_flight(
     db: &Arc<dyn Database + Send + Sync>,
 ) -> Result<swap_core::monero::Amount> {
