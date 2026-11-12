@@ -17,9 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     past that it queues again if it has not built its lock yet,
     and continues on its own only once the lock is built.
   - ASB: A lock our wallet can fund only once our own locked change unlocks waits for it,
-    out of the lock phase, for up to `monero_lock_retry_timeout` (40 minutes on mainnet).
+    out of the lock phase, while at least 3/5 of the Bitcoin cancel timelock is left
+    (18 of 30 blocks on mainnet). A failing construction is still retried for
+    `monero_lock_retry_timeout` (40 minutes on mainnet).
     A swap the whole wallet cannot fund refunds the Bitcoin early before building a lock.
-  - ASB: A swap setup leaves out the Monero that swaps in flight reserved.
+  - ASB: A freshly built lock is checked against the daemon's key images before it is used:
+    if another transaction in the pool or the chain already spends one of its inputs,
+    the swap waits for that spend to confirm and builds again.
+  - ASB: A swap setup leaves out the Monero that swaps in flight reserved,
+    including a relayed lock that is not confirmed yet, and reads the unlocked balance fresh.
+  - ASB: A quote computed while `ask_spread` is reloaded is not cached.
   - ASB: `maker.ask_spread` is reloaded from config.toml without a restart.
   - ASB: Up to 12 connections per peer (4 upstream), and every pending quote request is answered.
   - ASB: Identify never shares listen addresses, only the configured external addresses.
