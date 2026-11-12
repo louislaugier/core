@@ -1,0 +1,69 @@
+# Fork only (12/11/2026): reruns, once, the jobs of ci/5.0.3-hot12's CI run 43201860604
+# (7e9e5bb8) that failed on infrastructure rather than on code, as the same commands:
+# - docker_tests (bitcoin-wallet, integration): stalled 1 min in on an electrum wallet sync that
+#   never returned, then hit the 82 min timeout; the fork does not touch bitcoin-wallet and
+#   upstream's run passed it in 6 min;
+# - build (aarch64-apple-darwin, macos-15) and test (macos-15): GitHub never gave them a runner
+#   ("The job was not acquired by Runner of type hosted even after multiple attempts", macOS
+#   arm64 capacity).
+# This branch carries ci/5.0.3-hot12's code plus the buy-xmr CLI, so the reruns cover that code.
+# Runs only when this file changes.
+name: rerun-infra
+on:
+  push:
+    branches:
+      - 'ci/*-cli-**'
+    paths:
+      - '.github/workflows/rerun-infra.yml'
+jobs:
+  bitcoin_wallet_integration:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+      - name: Run test integration
+        run: >-
+          bash .github/scripts/annotate.sh timeout -s INT -k 120 4920
+          cargo test --package bitcoin-wallet --test integration -- --nocapture
+
+  build_aarch64_apple_darwin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: macos-15
+          target: aarch64-apple-darwin
+      - name: Build binary
+        run: bash .github/scripts/annotate.sh cargo build -p swap --target aarch64-apple-darwin -vv
+
+  test_macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: macos-15
+      - name: Run library tests
+        run: bash .github/scripts/annotate.sh cargo test --lib --no-fail-fast
+      - name: Run swap binary fee test
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/annotate.sh cargo test --package swap --bin swap swap_fee_excludes_funds_outside_the_input_limit
+      - name: Run Monero conflict tests
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/annotate.sh cargo test --package monero-tests --test double_spend
+      - name: Run Monero construction throttle tests
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/annotate.sh cargo test --manifest-path monero-wallet/Cargo.toml --test construction_throttle
+      - name: Run maker fee config tests
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/annotate.sh cargo test --package swap-env --test maker_fee_config
+      - name: Run env config tests (fork, 40 min mainnet lock retry window)
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
