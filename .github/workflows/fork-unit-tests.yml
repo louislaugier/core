@@ -10,6 +10,9 @@ on:
   push:
     branches:
       - 'ci/**'
+      # fork, 12/11/2026: not on the CLI branch (ci/5.0.3-cli-buyxmr), which only needs
+      # build-swap-cli: the maker image and the unit tests come from ci/5.0.3-hot12
+      - '!ci/*-cli-**'
   workflow_dispatch:
 jobs:
   unit:
