@@ -18,10 +18,12 @@ use tokio::sync::{Mutex, MutexGuard};
 /// [`LockPhaseSession::hold_expired`]).
 pub const MONERO_LOCK_PHASE_MAX_HOLD: Duration = Duration::from_secs(20 * 60);
 
-/// Hard cap on building the lock in `XmrReadyToLock`, which runs inside the phase. Upstream
-/// retries the construction for `monero_lock_retry_timeout` (30 min on mainnet), longer than
-/// a hold, and that budget only stops new attempts: the last one runs on, and one attempt can
-/// wait up to a cooldown for its construction turn and then build for another cooldown.
+/// Hard cap on one round of building the lock in `XmrReadyToLock`, which runs inside the
+/// phase. Upstream retries the construction for `monero_lock_retry_timeout` (40 min on the
+/// fork's mainnet), longer than a hold, and that budget only stops new attempts: the last one
+/// runs on, and one attempt can wait up to a cooldown for its construction turn and then build
+/// for another cooldown. The fork spreads that retry over rounds of at most this long and
+/// queues for the phase again between them (`LockRound` in `swap.rs`).
 pub const LOCK_CONSTRUCTION_BUDGET: Duration = Duration::from_secs(10 * 60);
 
 /// Hard cap on the shared-wallet scan that follows a failed construction, also inside the
@@ -33,9 +35,9 @@ pub const LOCK_FAILURE_SCAN_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// subscription it starts with).
 const LOCK_SELECTION_SLACK: Duration = Duration::from_secs(60);
 
-// A failing `XmrReadyToLock` step runs the construction and then the scan under one hold. If
-// their caps did not fit in it, the hold would cut the step, the swap would queue again with
-// fresh budgets, and it would never reach its early refund.
+// A failing `XmrReadyToLock` step runs a construction round and then the scan under one hold.
+// If their caps did not fit in it, the hold would cut the step before its early refund and
+// the swap would queue again to run the round once more.
 const _: () = assert!(
     LOCK_CONSTRUCTION_BUDGET.as_secs()
         + LOCK_FAILURE_SCAN_BUDGET.as_secs()
@@ -414,9 +416,9 @@ mod tests {
         assert!(next.holds_permit());
     }
 
-    /// The `XmrReadyToLock` step runs the capped construction and then the capped scan under
-    /// one hold, so a failing step always reaches its early refund (or the wait for the cancel
-    /// timelock) instead of being cut and requeued with fresh budgets forever.
+    /// The `XmrReadyToLock` step runs a capped construction round and then the capped scan
+    /// under one hold, so a failing step reaches its early refund (or the wait for the cancel
+    /// timelock) instead of being cut and requeued to run the round again.
     #[test]
     fn in_phase_budgets_fit_in_one_hold() {
         assert!(

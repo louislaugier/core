@@ -1,7 +1,7 @@
 //! Run an XMR/BTC swap in the role of Alice.
 //! Alice holds XMR and wishes receive BTC.
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::asb::{EventLoopHandle, LatestRate};
 use crate::common::retry;
@@ -50,7 +50,7 @@ use uuid::Uuid;
 static MONERO_LOCK_PHASE: LazyLock<MoneroLockPhase> =
     LazyLock::new(|| MoneroLockPhase::new(MONERO_LOCK_PHASE_MAX_HOLD));
 
-/// Upper bound for the wallet refresh and balance read in [`ensure_lock_is_fundable`].
+/// Upper bound for the wallet refresh and each balance read in [`check_lock_funding`].
 const FUNDABILITY_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `.expect` message for the persist retry loop, which never stops retrying.
@@ -78,8 +78,20 @@ where
     // separate `next_state` calls and the persist between them. See [`MONERO_LOCK_PHASE`].
     let mut lock_phase = MONERO_LOCK_PHASE.session();
 
+    // When this swap's first `XmrReadyToLock` round began in this process (fork): its Monero
+    // lock is retried for `monero_lock_retry_timeout` from then, over rounds that each fit in
+    // one hold of the lock phase (see `LockRound`).
+    let mut ready_to_lock_since: Option<Instant> = None;
+
     while !swap_machine::alice::is_complete(&current_state) && !exit_early(&current_state) {
         lock_phase.sync_to(lock_phase_step(&current_state)).await;
+
+        let selecting = lock_phase_step(&current_state) == PhaseStep::Selecting;
+        ready_to_lock_since = if selecting {
+            ready_to_lock_since.or_else(|| Some(Instant::now()))
+        } else {
+            None
+        };
 
         // While holding the permit, bound each step: the publish arm retries without a limit,
         // and a wedged swap must not keep others from locking Monero. Cancelling is safe:
@@ -97,6 +109,7 @@ where
             swap.developer_tip.clone(),
             swap.hermes_funding_policy,
             rate_service.clone(),
+            ready_to_lock_since,
         );
 
         current_state = match step_deadline {
@@ -113,6 +126,16 @@ where
             },
             None => step.await?,
         };
+
+        // `XmrReadyToLock` handed back unchanged (fork): this round built no lock, our own
+        // change is still locked or the round ran out, and the retry window is still open.
+        // Nothing changed, so nothing is persisted: the swap leaves the lock phase to the swaps
+        // queued behind it, pauses, and queues for the permit again.
+        if selecting && lock_phase_step(&current_state) == PhaseStep::Selecting {
+            lock_phase.release();
+            tokio::time::sleep(lock_requeue_pause(&swap.env_config)).await;
+            continue;
+        }
 
         // Release before the persist: the persist retries without a limit and must not pin
         // the process-wide permit.
@@ -175,6 +198,7 @@ async fn next_state<LR>(
     developer_tip: TipConfig,
     hermes_funding_policy: HermesFundingPolicy,
     mut rate_service: LR,
+    ready_to_lock_since: Option<Instant>,
 ) -> Result<AliceState>
 where
     LR: LatestRate,
@@ -278,12 +302,18 @@ where
                 .await;
 
             // This whole step runs inside the serialized lock phase, and a hold that runs out
-            // here only requeues the swap, which then starts over with fresh budgets. So the
-            // construction and the failure scan below are capped to end inside one hold:
-            // the retry budget stops new attempts, the timeout ends the attempt still running.
-            let construction_budget = env_config
-                .monero_lock_retry_timeout
-                .min(LOCK_CONSTRUCTION_BUDGET);
+            // here only requeues the swap. So the construction and the failure scan below are
+            // capped to end inside one hold: the retry budget stops new attempts, the timeout
+            // ends the attempt still running. Fork: one step is one round. A round that builds
+            // nothing while `monero_lock_retry_timeout` (counted from the first round, see
+            // `run_until`) is not over hands `XmrReadyToLock` back, and the swap queues again.
+            // `run_until` always passes when the first round began; without it the window
+            // counts as over (one round, then the failure path, as upstream after its retry).
+            let lock_retry_elapsed =
+                move || ready_to_lock_since.map_or(Duration::MAX, |since| since.elapsed());
+            let construction_budget =
+                lock_retry_left(env_config.monero_lock_retry_timeout, lock_retry_elapsed())
+                    .min(LOCK_CONSTRUCTION_BUDGET);
 
             let constructed = tokio::select! {
                 biased;
@@ -308,7 +338,7 @@ where
                             .map_err(backoff::Error::transient)?;
 
                         if has_received_outputs {
-                            return Err(backoff::Error::permanent(anyhow::anyhow!(
+                            return Ok(LockRound::Refused(anyhow::anyhow!(
                                 "Shared Monero wallet is not empty"
                             )));
                         }
@@ -323,17 +353,27 @@ where
                             .hermes_funding_transfer_request(hermes_funding_amount)
                             .address_and_amount(env_config.monero_network);
 
-                        let destinations = build_transfer_destinations(
+                        let destinations = match build_transfer_destinations(
                             lock_address,
                             amount,
                             hermes_funding,
                             developer_tip.clone(),
-                        )?;
+                        ) {
+                            Ok(destinations) => destinations,
+                            Err(error) => return Ok(LockRound::Refused(error)),
+                        };
 
-                        // Checked before taking a construction turn, so an unfundable swap
-                        // refunds at once instead of spending turns (and the lock phase
-                        // permit) on a lock it cannot fund. See `ensure_lock_is_fundable`.
-                        ensure_lock_is_fundable(&monero_wallet, &destinations).await?;
+                        // Checked before taking a construction turn, so a swap the wallet
+                        // cannot fund spends no turn (and no lock phase permit) on it: it
+                        // refunds at once, or waits for our locked change outside the phase.
+                        // See `check_lock_funding`.
+                        match check_lock_funding(&monero_wallet, &destinations).await? {
+                            LockFunding::Now => {}
+                            LockFunding::AfterOurChangeUnlocks(short) => {
+                                return Ok(LockRound::WaitingForChange(short));
+                            }
+                            LockFunding::Never(short) => return Ok(LockRound::Refused(short)),
+                        }
 
                         let turn_duration = monero_wallet.wait_for_construction_turn().await;
                         timeout(turn_duration, async {
@@ -345,7 +385,7 @@ where
 
                             let tx_key = receipt.tx_keys.get(&lock_address.to_string()).expect("monero-sys guarantees that the address has a valid tx key or the tx isn't published");
 
-                            Ok((
+                            Ok(LockRound::Built(
                                 TransferProof::new(monero::TxHash(receipt.txid), *tx_key),
                                 xmr_lock_tx,
                             ))
@@ -358,18 +398,40 @@ where
                     Duration::from_secs(30),
                 )) => result
                     .context("Monero lock construction ran out of its time in the lock phase")
-                    .and_then(|constructed| constructed)
+                    .and_then(|round| round)
                     .map(Some),
             };
 
             match constructed {
                 // If the construction was successful, we transition to the next state
-                Ok(Some((transfer_proof, xmr_lock_tx))) => {
+                Ok(Some(LockRound::Built(transfer_proof, xmr_lock_tx))) => {
                     AliceState::XmrLockTransactionConstructed {
                         monero_wallet_restore_blockheight,
                         xmr_lock_tx,
                         transfer_proof,
                         state3,
+                    }
+                }
+                // Fork: no lock in this round, but the retry window is still open. Hand
+                // `XmrReadyToLock` back: `run_until` lets the swaps queued behind this one take
+                // the lock phase, then queues it again. Waiting for our own locked change
+                // (05/10/2026) or a construction that kept failing for a whole round.
+                Ok(Some(LockRound::WaitingForChange(error))) | Err(error)
+                    if !lock_retry_left(
+                        env_config.monero_lock_retry_timeout,
+                        lock_retry_elapsed(),
+                    )
+                    .is_zero() =>
+                {
+                    tracing::info!(
+                        swap_id = %swap_id,
+                        error = %format!("{error:#}"),
+                        "No Monero lock built in this round; queueing for the lock phase again"
+                    );
+
+                    AliceState::XmrReadyToLock {
+                        state3,
+                        monero_wallet_restore_blockheight,
                     }
                 }
                 // If we were not able to lock the Monero funds before the timelock expired,
@@ -383,12 +445,12 @@ where
 
                     AliceState::SafelyAborted
                 }
-                Err(e) => {
+                Ok(Some(LockRound::WaitingForChange(e) | LockRound::Refused(e))) | Err(e) => {
                     tracing::error!(
                         swap_id = %swap_id,
                         error = ?e,
                         "Failed to lock Monero within {} seconds. Checking shared wallet before deciding recovery.",
-                        construction_budget.as_secs()
+                        env_config.monero_lock_retry_timeout.as_secs()
                     );
 
                     // Still inside the lock phase, so capped like the construction. A scan
@@ -1553,23 +1615,56 @@ async fn cancel_timelock_not_expired(
     ))
 }
 
-/// Refuses to construct a Monero lock the main wallet cannot fund right now. A concurrent
-/// swap whose lock just confirmed has taken its inputs, and its change stays locked for 10
-/// blocks. Without this check wallet2 can still pick outputs that are already spent, build
-/// a lock that double-spends, and wedge on a publish that is rejected forever. A permanent
-/// error here goes through the `XmrReadyToLock` error arm: it scans the shared wallet and
-/// then refunds the Bitcoin early (no Monero was locked, so that is safe). The wallet is
-/// refreshed first: a stale balance let swap 5eabdea8 pass this check on 26/08/2026. This
-/// is still a balance check, not an output check: only asking the daemon about the lock's
-/// key images would prove its inputs unspent. It reads the main account (index 0) only, the
-/// one the lock spends from: monero-sys builds it with `subaddr_account` 0, so Monero held
-/// in other accounts cannot fund it. The refresh and the read are bounded by
+/// What one `XmrReadyToLock` round came to, short of an error that its retries ran out on
+/// (fork).
+#[allow(clippy::large_enum_variant)]
+enum LockRound {
+    /// The lock is built: on to `XmrLockTransactionConstructed`.
+    Built(TransferProof, Transaction<NotPruned>),
+    /// The wallet can fund the lock only once our own locked change unlocks
+    /// ([`LockFunding::AfterOurChangeUnlocks`]). The swap queues again while the retry window
+    /// is open, instead of holding the lock phase or refunding.
+    WaitingForChange(anyhow::Error),
+    /// The lock cannot be built (the shared wallet is not empty, the wallet cannot fund it
+    /// at all, the destinations are invalid): the failure path decides the recovery.
+    Refused(anyhow::Error),
+}
+
+/// Whether the main wallet can fund a Monero lock now (fork, see [`check_lock_funding`]).
+enum LockFunding {
+    /// The unlocked balance of account 0 covers the lock and its fee.
+    Now,
+    /// It does not, but the total balance does: our own change (or another incoming
+    /// transfer) is still in its 10-block lock.
+    AfterOurChangeUnlocks(anyhow::Error),
+    /// Even the total balance is short: a concurrent swap consumed the shared balance.
+    Never(anyhow::Error),
+}
+
+/// Checks that the main wallet can fund the Monero lock built from `destinations` before a
+/// construction turn is taken. A concurrent swap whose lock just confirmed has taken its
+/// inputs, and its change stays locked for 10 blocks. Without this check wallet2 can still
+/// pick outputs that are already spent, build a lock that double-spends, and wedge on a
+/// publish that is rejected forever.
+///
+/// - [`LockFunding::Never`] goes through the `XmrReadyToLock` failure path: it scans the
+///   shared wallet and then refunds the Bitcoin early (no Monero was locked, so that is safe).
+/// - [`LockFunding::AfterOurChangeUnlocks`] makes the swap wait instead (05/10/2026, on 4.14:
+///   a 0.377 BTC swap was refunded while a 0.002 BTC sibling held 15.4 XMR of change in its
+///   10-block lock, 43.51 XMR unlocked for 58.66 XMR needed, 58.91 XMR in total).
+///
+/// The wallet is refreshed first: a stale balance let swap 5eabdea8 pass this check on
+/// 26/08/2026. This is still a balance check, not an output check: only asking the daemon
+/// about the lock's key images would prove its inputs unspent. The unlocked balance is the
+/// main account's (index 0) only, the one the lock spends from: monero-sys builds it with
+/// `subaddr_account` 0. The total spans every account: Monero outside account 0 only delays
+/// the same early refund. The refresh and the reads are bounded by
 /// [`FUNDABILITY_CHECK_TIMEOUT`], so a slow daemon means a retry, not a stalled swap that
 /// keeps the lock phase permit.
-async fn ensure_lock_is_fundable(
+async fn check_lock_funding(
     monero_wallet: &monero::Wallets,
     destinations: &[(monero_address::MoneroAddress, monero_oxide_ext::Amount)],
-) -> Result<(), backoff::Error<anyhow::Error>> {
+) -> Result<LockFunding, backoff::Error<anyhow::Error>> {
     let needed_pico = destinations
         .iter()
         .map(|(_, amount)| amount.as_pico())
@@ -1596,15 +1691,60 @@ async fn ensure_lock_is_fundable(
 
     let unlocked_pico = unlocked.as_pico();
 
-    if unlocked_pico < needed_pico {
-        return Err(backoff::Error::permanent(anyhow::anyhow!(
-            "Insufficient unlocked Monero to fund the lock transaction \
-             ({unlocked_pico} < {needed_pico} piconero); a concurrent swap consumed \
-             the shared balance, refunding this swap early"
-        )));
+    if unlocked_pico >= needed_pico {
+        return Ok(LockFunding::Now);
     }
 
-    Ok(())
+    let total_pico = timeout(FUNDABILITY_CHECK_TIMEOUT, async {
+        monero_wallet
+            .main_wallet()
+            .await
+            .total_balance()
+            .await
+            .context("Failed to read the total Monero balance before constructing the lock")
+    })
+    .await
+    .context("Timed out reading the total Monero balance before constructing the lock")
+    .map_err(backoff::Error::transient)?
+    .map_err(backoff::Error::transient)?
+    .as_pico();
+
+    let short = anyhow::anyhow!(
+        "Insufficient unlocked Monero to fund the lock transaction \
+         ({unlocked_pico} < {needed_pico} piconero, total {total_pico})"
+    );
+
+    Ok(
+        if waits_for_unlock(unlocked_pico, total_pico, needed_pico) {
+            LockFunding::AfterOurChangeUnlocks(
+                short.context("Waiting for our locked change to unlock before locking Monero"),
+            )
+        } else {
+            LockFunding::Never(short.context(
+                "A concurrent swap consumed the shared balance, refunding this swap early",
+            ))
+        },
+    )
+}
+
+/// Whether a lock the unlocked balance cannot fund yet should wait instead of refunding: the
+/// total balance (unlocked plus change still in its 10-block lock) covers it.
+fn waits_for_unlock(unlocked_pico: u64, total_pico: u64, needed_pico: u64) -> bool {
+    unlocked_pico < needed_pico && total_pico >= needed_pico
+}
+
+/// What is left of `monero_lock_retry_timeout` for a swap whose `XmrReadyToLock` rounds began
+/// `elapsed` ago (fork): the timeout spans every round, so a swap that queues for the lock
+/// phase again does not restart it. Zero once it is over.
+fn lock_retry_left(retry_timeout: Duration, elapsed: Duration) -> Duration {
+    retry_timeout.saturating_sub(elapsed)
+}
+
+/// How long a swap whose `XmrReadyToLock` round built no lock stays out of the lock phase
+/// before it queues again (fork): half a Monero block, since our locked change unlocks with
+/// a block. The swaps already queued get the permit first either way (the queue is FIFO).
+fn lock_requeue_pause(env_config: &Config) -> Duration {
+    env_config.monero_avg_block_time / 2
 }
 
 /// Where `state` sits in the serialized Monero lock phase (see [`MONERO_LOCK_PHASE`]).
@@ -1683,6 +1823,56 @@ async fn abandon_lock_phase(state: &AliceState, monero_wallet: &monero::Wallets)
             tracing::warn!(%tx_hash, %error, "Failed to scan the lock transaction on release")
         }
         Err(_) => tracing::warn!(%tx_hash, "Timed out scanning the lock transaction on release"),
+    }
+}
+
+#[cfg(test)]
+mod unlock_wait_tests {
+    use super::{lock_requeue_pause, lock_retry_left, waits_for_unlock};
+    use std::time::Duration;
+    use swap_env::env::{GetConfig, Mainnet};
+
+    /// 05/10/2026, swap 6662ebc5: 43.51 XMR unlocked, 58.91 XMR in total, 58.66 XMR needed.
+    const UNLOCKED: u64 = 43_510_399_743_274;
+    const TOTAL: u64 = 58_908_888_836_450;
+    const NEEDED: u64 = 58_657_784_011_220 + 1_000_000_000;
+
+    #[test]
+    fn waits_when_locked_change_covers_the_lock() {
+        assert!(waits_for_unlock(UNLOCKED, TOTAL, NEEDED));
+    }
+
+    #[test]
+    fn refunds_when_even_the_total_is_short() {
+        assert!(!waits_for_unlock(UNLOCKED, NEEDED - 1, NEEDED));
+    }
+
+    #[test]
+    fn nothing_to_wait_for_when_unlocked_covers_it() {
+        assert!(!waits_for_unlock(TOTAL, TOTAL, NEEDED));
+    }
+
+    /// The window is counted from the first round: a swap that queued again keeps what is
+    /// left of it, it does not start over.
+    #[test]
+    fn the_retry_window_spans_every_round() {
+        let window = Duration::from_secs(40 * 60);
+        assert_eq!(
+            lock_retry_left(window, Duration::from_secs(25 * 60)),
+            Duration::from_secs(15 * 60)
+        );
+        assert!(lock_retry_left(window, window).is_zero());
+        assert!(lock_retry_left(window, Duration::MAX).is_zero());
+    }
+
+    /// Our change unlocks 10 blocks after the sibling's lock confirms (~20 min on mainnet,
+    /// with a long tail): the mainnet window must outlast that with room to spare, and a swap
+    /// that queues again checks at least twice per block.
+    #[test]
+    fn the_mainnet_window_outlasts_a_ten_block_unlock() {
+        let mainnet = Mainnet::get_config();
+        assert!(mainnet.monero_lock_retry_timeout >= mainnet.monero_avg_block_time * 20);
+        assert!(lock_requeue_pause(&mainnet) * 2 <= mainnet.monero_avg_block_time);
     }
 }
 
