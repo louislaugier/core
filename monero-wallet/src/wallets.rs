@@ -365,6 +365,29 @@ impl Wallets {
         Ok(any_confirmed_spent(&statuses))
     }
 
+    /// Whether the daemon reports every input of `tx` as unspent: no key image is spent in the
+    /// blockchain or by a transaction in its pool (fork, 12/11/2026).
+    ///
+    /// wallet2 marks an output spent only once the transaction spending it is in a block, so a
+    /// lock built while another relayed lock is still unconfirmed can select that lock's
+    /// inputs, and a lock that double spends is rejected forever. This asks the daemon about
+    /// the outputs themselves, which a balance check cannot. A lying daemon can only delay a
+    /// lock (by reporting a spend) or hide a spend (as if this check did not exist).
+    pub async fn tx_inputs_unspent(&self, tx: &Transaction<NotPruned>) -> Result<bool> {
+        use monero_wallet_ng::rpc::IsKeyImageSpent;
+
+        let key_images = tx_key_images(tx);
+
+        let statuses = self
+            .rpc_client()
+            .await?
+            .is_key_image_spent(&key_images)
+            .await
+            .context("Failed to query key image spend status")?;
+
+        Ok(statuses.len() == key_images.len() && all_unspent(&statuses))
+    }
+
     /// May scan from `restore_height` to the latest sufficiently confirmed block for a conflict; this can take a long time.
     pub async fn has_confirmed_double_spent(
         &self,
@@ -830,9 +853,19 @@ fn any_confirmed_spent(statuses: &[monero_wallet_ng::rpc::KeyImageSpentStatus]) 
         .any(|status| matches!(status, KeyImageSpentStatus::SpentInBlockchain))
 }
 
+/// Returns true if no key image is spent, neither in the blockchain nor by a transaction in the
+/// daemon's pool (fork, see [`Wallets::tx_inputs_unspent`]).
+fn all_unspent(statuses: &[monero_wallet_ng::rpc::KeyImageSpentStatus]) -> bool {
+    use monero_wallet_ng::rpc::KeyImageSpentStatus;
+
+    statuses
+        .iter()
+        .all(|status| matches!(status, KeyImageSpentStatus::Unspent))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::any_confirmed_spent;
+    use super::{all_unspent, any_confirmed_spent};
     use monero_wallet_ng::rpc::KeyImageSpentStatus;
 
     #[test]
@@ -866,5 +899,21 @@ mod tests {
             KeyImageSpentStatus::SpentInPool,
             KeyImageSpentStatus::SpentInBlockchain,
         ]));
+    }
+
+    /// Fork (12/11/2026): a lock built from inputs another relayed lock already spends must
+    /// not be used. The pool counts here, unlike for the rebuild decision above: our own
+    /// unconfirmed lock sits in the pool.
+    #[test]
+    fn inputs_are_unspent_only_when_no_key_image_is_spent_anywhere() {
+        assert!(all_unspent(&[
+            KeyImageSpentStatus::Unspent,
+            KeyImageSpentStatus::Unspent
+        ]));
+        assert!(!all_unspent(&[
+            KeyImageSpentStatus::Unspent,
+            KeyImageSpentStatus::SpentInPool
+        ]));
+        assert!(!all_unspent(&[KeyImageSpentStatus::SpentInBlockchain]));
     }
 }
