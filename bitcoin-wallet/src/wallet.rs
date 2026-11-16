@@ -4256,3 +4256,94 @@ mod apollo_builder_tests {
         Ok(())
     }
 }
+
+/// Fork (16/11/2026): the fee estimate runs one Electrum call at a time. electrum-client 0.24.1
+/// can lose the wake-up of the second of two concurrent callers on one connection, which then
+/// waits until another call reads the socket. On an idle maker no other call comes, so a quote
+/// computation hung for good (asb-a on 5.0.4, 16/11/2026: no quote from 17:43 to 23:14 UTC).
+#[cfg(test)]
+mod fee_rate_serial_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// Long enough that a second concurrent request reaches the stub before the first answer.
+    const ANSWER_DELAY: Duration = Duration::from_millis(500);
+
+    fn answer(request: &serde_json::Value) -> serde_json::Value {
+        let result = match request["method"].as_str() {
+            Some("blockchain.estimatefee") => serde_json::json!(0.0001),
+            Some("mempool.get_fee_histogram") => serde_json::json!([[10.0, 2_000_000]]),
+            _ => serde_json::Value::Null,
+        };
+        serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result })
+    }
+
+    /// An Electrum stub. It answers each request ANSWER_DELAY after it arrived, in order, and
+    /// records the largest number of requests one connection held unanswered at once.
+    fn electrum_stub() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub");
+        let url = format!("tcp://{}", listener.local_addr().expect("stub address"));
+        let max_open = Arc::new(AtomicUsize::new(0));
+        let max = max_open.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let max = max.clone();
+                std::thread::spawn(move || serve(stream, max));
+            }
+        });
+        (url, max_open)
+    }
+
+    fn serve(stream: std::net::TcpStream, max: Arc<AtomicUsize>) {
+        let Ok(mut writer) = stream.try_clone() else {
+            return;
+        };
+        let open = Arc::new(AtomicUsize::new(0));
+        let open_for_answers = open.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<(Instant, serde_json::Value)>();
+        std::thread::spawn(move || {
+            for (received, request) in rx {
+                std::thread::sleep(ANSWER_DELAY.saturating_sub(received.elapsed()));
+                // Counted as answered before the write, so a caller that waits for this answer
+                // can never be seen as overlapping it.
+                open_for_answers.fetch_sub(1, SeqCst);
+                if writeln!(writer, "{}", answer(&request)).is_err() {
+                    return;
+                }
+            }
+        });
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                return;
+            };
+            max.fetch_max(open.fetch_add(1, SeqCst) + 1, SeqCst);
+            if tx.send((Instant::now(), request)).is_err() {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_estimate_makes_one_electrum_call_at_a_time() {
+        let (url, max_open) = electrum_stub();
+        let client = Client::new(&[url], Duration::from_secs(60))
+            .await
+            .expect("client for the stub");
+
+        let fee_rate = tokio::time::timeout(Duration::from_secs(30), client.estimate_feerate(1))
+            .await
+            .expect("the fee estimate never returned")
+            .expect("the fee estimate failed");
+
+        // 0.0001 BTC/kvB and the histogram's 10 sat/vB are the same rate.
+        assert_eq!(fee_rate, FeeRate::from_sat_per_vb(10).expect("valid rate"));
+        assert_eq!(
+            max_open.load(SeqCst),
+            1,
+            "two Electrum calls were in flight on one connection at the same time"
+        );
+    }
+}
