@@ -6,6 +6,7 @@ on:
     branches:
       - "master" # Always build head of master for the badge in the README
       - "ci/5.0.4-hot12" # fork only: the full suite on the 5.0.4 port, without a PR
+      - "ci/5.0.4-hot12-fix1" # fork only: the same suite on the quote-timeout fix (16/11/2026)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

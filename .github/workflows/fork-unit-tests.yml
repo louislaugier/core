@@ -4,7 +4,8 @@
 # (unlock_wait_tests), the setup check that leaves out Monero reserved by swaps in flight
 # (setup_reserve_tests), the js-libp2p flood guards (flood_agent_tests, flood_decode_tests),
 # the quote tests with the 1 % max headroom (asb::event_loop::tests), and the 40 min mainnet
-# lock retry window (swap-env's trusted_daemon_config).
+# lock retry window (swap-env's trusted_daemon_config). 16/11/2026: the bounded quote computation
+# (asb::event_loop::tests) and the serial fee estimate (bitcoin-wallet fee_rate_serial_tests).
 name: fork-unit-tests
 on:
   push:
@@ -40,6 +41,12 @@ jobs:
           cargo test --package swap --lib --
           lock_phase unlock_wait_tests setup_reserve_tests flood_agent_tests
           flood_decode_tests asb::event_loop::tests
+      # fork (16/11/2026): the fee estimate makes one Electrum call at a time (quote outage of
+      # asb-a on 5.0.4: a lost electrum-client wake-up hung the only quote computation)
+      - name: The fork's serial fee estimate (bitcoin-wallet)
+        run: >-
+          bash .github/scripts/annotate.sh
+          cargo test --package bitcoin-wallet --lib -- fee_rate_serial_tests
       - name: The fork's env defaults
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
       # --manifest-path, not --package: monero-oxide's wallet crate is also named monero-wallet
