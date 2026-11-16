@@ -2949,11 +2949,12 @@ impl BitcoinWallet for Wallet {
 
 impl EstimateFeeRate for Client {
     async fn estimate_feerate(&self, target_block: u32) -> Result<FeeRate> {
-        // Now that the Electrum client methods are async, we can parallelize the calls
-        let (electrum_conservative_fee_rate, electrum_histogram_fee_rate) = tokio::join!(
-            self.estimate_fee_rate(target_block),
-            self.estimate_fee_rate_from_histogram(target_block)
-        );
+        // Fork (16/11/2026): one call after the other, not `tokio::join!`. Both go to the same
+        // Electrum connection, and electrum-client 0.24.1 can lose the wake-up of the second of
+        // two concurrent callers (`RawClient::recv` waits on a channel without a timeout): that
+        // call returns only when another call reads the socket, which an idle maker never makes.
+        let electrum_conservative_fee_rate = self.estimate_fee_rate(target_block).await;
+        let electrum_histogram_fee_rate = self.estimate_fee_rate_from_histogram(target_block).await;
 
         match (electrum_conservative_fee_rate, electrum_histogram_fee_rate) {
             // If both the histogram and conservative fee rate are successful, we use the higher one

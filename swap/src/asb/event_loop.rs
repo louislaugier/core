@@ -1,6 +1,7 @@
 use self::quote::{
-    QUOTE_CACHE_TTL, QuoteCacheKey, bitcoin_health_check_with_retry, make_quote,
-    reserve_proof_with_timeout, unlocked_monero_balance_with_timeout,
+    QUOTE_CACHE_TTL, QUOTE_COMPUTATION_TIMEOUT, QuoteCacheKey, bitcoin_health_check_with_retry,
+    bounded_quote_computation, make_quote, reserve_proof_with_timeout,
+    unlocked_monero_balance_with_timeout,
 };
 use crate::asb::{Behaviour, OutEvent};
 use crate::monero;
@@ -1121,23 +1122,33 @@ where
                 ))
             };
 
-            let result = match prepare.await {
-                Ok(minimum_swap_amount) => {
-                    make_quote(
-                        min_buy,
-                        max_buy,
-                        rate,
-                        get_unlocked_balance,
-                        get_reserved_items,
-                        get_reserve_proof,
-                        developer_tip,
-                        refund_policy,
-                        minimum_swap_amount,
-                    )
-                    .await
+            let compute = async {
+                match prepare.await {
+                    Ok(minimum_swap_amount) => {
+                        make_quote(
+                            min_buy,
+                            max_buy,
+                            rate,
+                            get_unlocked_balance,
+                            get_reserved_items,
+                            get_reserve_proof,
+                            developer_tip,
+                            refund_policy,
+                            minimum_swap_amount,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(Arc::new(err)),
                 }
-                Err(err) => Err(Arc::new(err)),
             };
+
+            // Fork (16/11/2026): only one quote computation runs at a time
+            // (`ensure_quote_computation_is_inflight`), so one that never ends leaves every later
+            // request unanswered until the request-response timeout, for as long as the process
+            // lives. Bounded below that timeout: the waiting peers get a zero quote and the next
+            // request starts a fresh computation.
+            let (result, timed_out) =
+                bounded_quote_computation(QUOTE_COMPUTATION_TIMEOUT, compute).await;
 
             // Insert the computed quote into the cache
             // Need to clone it as insert takes ownership
@@ -1146,7 +1157,10 @@ where
             // reload empties the cache, but a computation already in flight would put a quote
             // at the old spread back, served for up to `QUOTE_CACHE_TTL`. It still answers the
             // requests that started it; the next one computes at the new spread.
-            if spread_source.current_ask_spread() == spread_at_start {
+            // A timed-out computation is not cached either, so the next request retries at once.
+            if timed_out {
+                tracing::warn!("Quote computation timed out; not caching its zero quote");
+            } else if spread_source.current_ask_spread() == spread_at_start {
                 quote_cache.insert(key, result.clone());
             } else {
                 tracing::debug!(
@@ -2186,6 +2200,28 @@ mod quote {
 
     /// The time-to-live for quotes in the cache
     pub const QUOTE_CACHE_TTL: Duration = Duration::from_secs(120);
+
+    /// Upper bound of one quote computation (fork, 16/11/2026). Below the 60 s request-response
+    /// timeout (`swap_p2p::defaults::QUOTE_REQUEST_TIMEOUT`), so the peers waiting on it are
+    /// answered (with a zero quote) instead of timing out.
+    pub const QUOTE_COMPUTATION_TIMEOUT: Duration = Duration::from_secs(45);
+
+    /// Runs one quote computation for at most `limit` (fork, 16/11/2026). Returns its result, or
+    /// an error when it did not finish in time, and whether it timed out.
+    pub async fn bounded_quote_computation<T>(
+        limit: Duration,
+        computation: impl std::future::Future<Output = Result<T, Arc<anyhow::Error>>>,
+    ) -> (Result<T, Arc<anyhow::Error>>, bool) {
+        match timeout(limit, computation).await {
+            Ok(result) => (result, false),
+            Err(_) => (
+                Err(Arc::new(anyhow!(
+                    "Quote computation did not finish within {limit:?}"
+                ))),
+                true,
+            ),
+        }
+    }
 
     /// The key for the quote cache
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3357,7 +3393,8 @@ mod tests {
         let (result, timed_out) = bounded_quote_computation(QUOTE_COMPUTATION_TIMEOUT, stuck).await;
         assert!(timed_out);
         assert!(result.is_err());
-        assert_eq!(started.elapsed(), QUOTE_COMPUTATION_TIMEOUT);
+        assert!(started.elapsed() >= QUOTE_COMPUTATION_TIMEOUT);
+        assert!(started.elapsed() < swap_p2p::defaults::QUOTE_REQUEST_TIMEOUT);
 
         let done = async { Ok(Arc::new(BidQuote::ZERO)) };
         let (result, timed_out) = bounded_quote_computation(QUOTE_COMPUTATION_TIMEOUT, done).await;
