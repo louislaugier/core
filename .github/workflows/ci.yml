@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - "master" # Always build head of master for the badge in the README
-      - "ci/5.0.3-hot12" # fork only: the full suite on the 5.0.3 port, without a PR
+      - "ci/5.0.4-hot12" # fork only: the full suite on the 5.0.4 port, without a PR
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 0 # fork: the clippy gate lints pristine 5.0.3 too
+          fetch-depth: 0 # fork: the clippy gate lints pristine 5.0.4 too
 
       - name: Free runner disk (fork, the gate keeps two trees' clippy output)
         run: |
@@ -32,9 +32,9 @@ jobs:
 
       # fork (12/11/2026): upstream's clippy step fails on 5.0.3 itself and stops at the first
       # crate with a finding, before the crates the fork changed. This lints every crate of the
-      # fork and of pristine 5.0.3 (--cap-lints warn, default and all features) and fails only on
-      # findings that 5.0.3 does not have at the same place (see .github/scripts/clippy_gate.py).
-      - name: Clippy gate (fork) - every crate, the fork against pristine 5.0.3
+      # fork and of pristine 5.0.4 (--cap-lints warn, default and all features) and fails only on
+      # findings that 5.0.4 does not have at the same place (see .github/scripts/clippy_gate.py).
+      - name: Clippy gate (fork) - every crate, the fork against pristine 5.0.4
         run: bash .github/scripts/clippy_gate.sh
 
       - name: Run clippy with default features
@@ -173,7 +173,7 @@ jobs:
         run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
 
   # fork (12/11/2026): upstream's CI fails "Run library tests" on 5.0.3 itself (run 42796064507,
-  # ubuntu and macos). The same command on pristine 5.0.3, published as annotations, so each
+  # ubuntu and macos). The same command on pristine 5.0.4 (16/11/2026), published as annotations, so each
   # failing test of the fork's run can be checked against upstream's own. Never fails the run.
   baseline_lib_tests:
     runs-on: ubuntu-22.04
@@ -183,10 +183,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check out pristine 5.0.3, keeping the fork's annotate.sh
+      - name: Check out pristine 5.0.4, keeping the fork's annotate.sh
         run: |
           cp .github/scripts/annotate.sh "$RUNNER_TEMP/annotate.sh"
-          git checkout --force 5664a2dc2066f188ed2196a65261c61302635f38
+          git checkout --force dfb4a4cd2e09225696567b4b951b9df866988b86
           git log -1 --format='%H %s'
 
       - name: Setup build environment (cli tools, dependencies)
@@ -194,7 +194,7 @@ jobs:
         with:
           host: ubuntu-22.04
 
-      - name: Library tests on pristine 5.0.3 (upstream baseline)
+      - name: Library tests on pristine 5.0.4 (upstream baseline)
         continue-on-error: true
         run: bash "$RUNNER_TEMP/annotate.sh" cargo test --lib --no-fail-fast
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fork CI (12/11/2026): clippy findings of the fork vs those of pristine 5.0.3.
+"""Fork CI (12/11/2026, base 5.0.4 since 16/11): clippy findings of the fork vs pristine upstream.
 
 Both trees are linted the way upstream's static_analysis step lints them (--workspace
 --all-targets, -D warnings), but with --cap-lints warn, so that a finding in one crate no longer
@@ -126,10 +126,10 @@ def main():
     head, basef = findings(head_log), findings(base_log)
     hs = hunks(base)
     # Matched on place and code, not on the text: a count in the text may move with the fork
-    # (e.g. too_many_arguments "(10/7)" where 5.0.3 says "(9/7)" for the same function).
-    # A finding 5.0.3 has on a line the fork rewrote (e.g. a signature it made generic) is
+    # (e.g. too_many_arguments "(10/7)" where the base says "(9/7)" for the same function).
+    # A finding the base has on a line the fork rewrote (e.g. a signature it made generic) is
     # upstream's own too when the fork's version of that hunk has the same lint with the same
-    # text, counted one for one: (file, hunk, code, text) -> how many 5.0.3 has there.
+    # text, counted one for one: (file, hunk, code, text) -> how many the base has there.
     mapped, in_hunk = {}, {}
     for (f, ln, col, code, text) in basef:
         if f == '-':
@@ -148,11 +148,11 @@ def main():
         base_text = mapped.get(key) if f == '-' else mapped.get((f, ln, col, code))
         hk = (f, hunk_of_new(f, ln, hs), code, text)
         if base_text is not None:
-            upstream.append(line + ('' if base_text == text else f'   [5.0.3: {base_text}]'))
+            upstream.append(line + ('' if base_text == text else f'   [base: {base_text}]'))
             by_code[code] = by_code.get(code, 0) + 1
         elif f != '-' and hk[1] is not None and in_hunk.get(hk, 0) > 0:
             in_hunk[hk] -= 1
-            upstream.append(line + '   [5.0.3 has it in the hunk the fork rewrote, same text]')
+            upstream.append(line + '   [the base has it in the hunk the fork rewrote, same text]')
             by_code[code] = by_code.get(code, 0) + 1
         elif f == '-':
             ours.append(line + '   [no location]')
@@ -160,9 +160,9 @@ def main():
             ours.append(line + ('   [changed line]' if changed(f, ln, hs) else '   [upstream line]'))
     rc_note = []
     if head_rc != '0' and base_rc == '0':
-        rc_note = [f'cargo clippy exited {head_rc} on the fork but 0 on 5.0.3']
-    summary = (f'{label}: fork {len(head)} findings (cargo exit {head_rc}), 5.0.3 {len(basef)} '
-               f'(cargo exit {base_rc}); shared with 5.0.3 (upstream\'s own) {len(upstream)}; '
+        rc_note = [f'cargo clippy exited {head_rc} on the fork but 0 on the base']
+    summary = (f'{label}: fork {len(head)} findings (cargo exit {head_rc}), base {len(basef)} '
+               f'(cargo exit {base_rc}); shared with the base (upstream\'s own) {len(upstream)}; '
                f'new with the fork {len(ours)}')
     print(summary)
     for x in rc_note + ours:
