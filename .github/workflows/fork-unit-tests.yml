@@ -16,8 +16,29 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+# fork (16/11/2026): on a *-red branch only the red-first tests of the quote-timeout fix run, on
+# port/5.0.4-hot12 (d9e1dcee6) without the fix. Both jobs are expected to FAIL.
 jobs:
-  unit:
+  red-bitcoin-wallet:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - name: Setup build environment (cli tools, dependencies)
+        uses: ./.github/actions/setup-build-environment
+        with:
+          host: ubuntu-22.04
+      - name: Serial fee estimate (expected red without the fix)
+        run: >-
+          bash .github/scripts/annotate.sh
+          cargo test --package bitcoin-wallet --lib -- fee_rate_serial_tests
+  red-swap:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     steps:
@@ -29,22 +50,11 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
       - name: Setup build environment (cli tools, dependencies)
-        uses: $/.github/actions/setup-build-environment
+        uses: ./.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
-      # annotate.sh (ci branches only): a failure publishes its errors and panics as annotations,
-      # readable without a login (12/11/2026)
-      - name: Unit tests of the fork's lock, setup, flood and quote changes
+      - name: Bounded quote computation (expected red without the fix)
         run: >-
           bash .github/scripts/annotate.sh
           cargo test --package swap --lib --
-          lock_phase unlock_wait_tests setup_reserve_tests flood_agent_tests
-          flood_decode_tests asb::event_loop::tests
-      - name: The fork's env defaults
-        run: bash .github/scripts/annotate.sh cargo test --package swap-env --test trusted_daemon_config
-      # --manifest-path, not --package: monero-oxide's wallet crate is also named monero-wallet
-      # 0.1.0, so `-p monero-wallet` is ambiguous and cargo stops before building anything
-      - name: The fork's key-image check of a built lock (monero-wallet)
-        run: >-
-          bash .github/scripts/annotate.sh
-          cargo test --manifest-path monero-wallet/Cargo.toml --lib -- wallets::tests
+          asb::event_loop::tests::a_stuck_quote_computation_ends_before_the_request_timeout
