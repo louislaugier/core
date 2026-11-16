@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           submodules: recursive
           fetch-depth: 0
@@ -21,7 +21,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
-      - uses: ./.github/actions/setup-build-environment
+      - uses: $/.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
       - name: build swap (release)
@@ -38,7 +38,7 @@ jobs:
           tar -C target/release -cf "swap-cli-${ver}-${suffix}.tar" swap
           sha256sum "swap-cli-${ver}-${suffix}.tar"
           echo "TAG=cli-${ver}-${suffix}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ env.TAG }}
           name: ${{ env.TAG }}
