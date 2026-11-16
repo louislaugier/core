@@ -3059,6 +3059,58 @@ mod tests {
         assert_eq!(result.max_quantity, bitcoin::Amount::ZERO);
     }
 
+    /// Fork: 5.0.4's smallest amount that setup accepts is checked against the
+    /// max after the fork's 1 % headroom, not against the full lockable balance.
+    /// A minimum between the two gives no trade, and one under it keeps the
+    /// lowered max.
+    #[tokio::test]
+    async fn test_make_quote_minimum_setup_accepts_meets_the_one_percent_headroom() {
+        let min_buy = bitcoin::Amount::from_sat(100_000);
+        let max_buy = bitcoin::Amount::from_sat(800_000);
+        let rate = FixedRate::default();
+        // 0.5 XMR is about 500_000 sats at the fixed rate of 0.01, under max_buy;
+        // the quote max is 1 % under what the wallet can lock.
+        let balance = monero::Amount::parse_monero("0.5").unwrap();
+        let lockable = balance
+            .max_bitcoin_for_price(rate.value().ask().unwrap())
+            .unwrap();
+        let headroom_max = bitcoin::Amount::from_sat(lockable.to_sat() / 100 * 99);
+        assert!(headroom_max < lockable && lockable < max_buy);
+
+        for (minimum, expected) in [
+            // above the lowered max, still within the lockable balance: no trade
+            (
+                headroom_max.to_sat() + 1,
+                (bitcoin::Amount::ZERO, bitcoin::Amount::ZERO),
+            ),
+            (headroom_max.to_sat(), (headroom_max, headroom_max)),
+            (300_000, (bitcoin::Amount::from_sat(300_000), headroom_max)),
+        ] {
+            let reserved_items: Vec<MockReservedItem> = vec![];
+            let result = make_quote(
+                min_buy,
+                max_buy,
+                rate.clone(),
+                || async { Ok(balance) },
+                || async { Ok(reserved_items) },
+                || async { Err(anyhow::anyhow!("no reserve proof")) },
+                Decimal::ZERO,
+                RefundPolicyWire::PartialRefund {
+                    anti_spam_deposit_ratio: Decimal::new(1, 2),
+                },
+                Some(bitcoin::Amount::from_sat(minimum)),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                (result.min_quantity, result.max_quantity),
+                expected,
+                "{minimum}"
+            );
+        }
+    }
+
     /// Setup accepts no amount between the configured minimum and maximum, for
     /// example because the fees of the refund path are too high.
     #[tokio::test]
