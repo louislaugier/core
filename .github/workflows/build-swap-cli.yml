@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - 'ci/cli-**'
-      # fork, 12/11/2026: the 5.0.3 port's CLI branch, ci/5.0.3-cli-buyxmr
+      # fork: the ports' CLI branches (ci/5.0.3-cli-buyxmr 12/11, ci/5.0.4-cli-buyxmr 16/11/2026)
       - 'ci/*-cli-**'
   workflow_dispatch:
 permissions:
