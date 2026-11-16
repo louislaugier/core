@@ -3344,4 +3344,27 @@ mod tests {
             self.reserved
         }
     }
+
+    /// Fork (16/11/2026): one quote computation serves every waiting request, and a new one
+    /// starts only when it ends. A computation that never ended left every later request
+    /// unanswered until the 60 s request-response timeout, for 5 h 31 (asb-a on 5.0.4).
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_quote_computation_ends_before_the_request_timeout() {
+        assert!(QUOTE_COMPUTATION_TIMEOUT < swap_p2p::defaults::QUOTE_REQUEST_TIMEOUT);
+
+        let started = tokio::time::Instant::now();
+        let stuck = std::future::pending::<Result<Arc<BidQuote>, Arc<anyhow::Error>>>();
+        let (result, timed_out) = bounded_quote_computation(QUOTE_COMPUTATION_TIMEOUT, stuck).await;
+        assert!(timed_out);
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), QUOTE_COMPUTATION_TIMEOUT);
+
+        let done = async { Ok(Arc::new(BidQuote::ZERO)) };
+        let (result, timed_out) = bounded_quote_computation(QUOTE_COMPUTATION_TIMEOUT, done).await;
+        assert!(!timed_out);
+        assert_eq!(
+            *result.expect("a finished computation passes through"),
+            BidQuote::ZERO
+        );
+    }
 }
