@@ -1,5 +1,5 @@
 # Fork only (05/10/2026): build-asb-mutex builds the maker image but runs no test. This runs
-# the unit tests of the fork's own changes on every ci/** push (5.0.3 port, 12/11/2026):
+# the unit tests of the fork's own changes on every ci/** push (5.0.3 port 12/11, 5.0.4 16/11/2026):
 # the serialized Monero lock phase (lock_phase), the wait for our locked change
 # (unlock_wait_tests), the setup check that leaves out Monero reserved by swaps in flight
 # (setup_reserve_tests), the js-libp2p flood guards (flood_agent_tests, flood_decode_tests),
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           submodules: recursive
       - name: free runner disk (monero-sys build needs >14 GB)
@@ -24,7 +24,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
       - name: Setup build environment (cli tools, dependencies)
-        uses: ./.github/actions/setup-build-environment
+        uses: $/.github/actions/setup-build-environment
         with:
           host: ubuntu-22.04
       - name: Unit tests of the fork's lock, setup, flood and quote changes

@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Fork: what louislaugier/core carries on top of 5.0.3 (branch `port/5.0.3-hot12`, image
-  branch `ci/5.0.3-hot12`):
+- Fork: what louislaugier/core carries on top of 5.0.4 (branch `port/5.0.4-hot12`, image
+  branch `ci/5.0.4-hot12`; the same commits as `port/5.0.3-hot12`, cherry-picked onto 5.0.4):
   - ASB: Only one swap at a time is in the Monero lock phase,
     from output selection (`XmrReadyToLock`) to the lock's first confirmation.
     wallet2 does not count a relayed lock's inputs as spent,
@@ -30,12 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - ASB: `maker.ask_spread` is reloaded from config.toml without a restart.
   - ASB: Up to 12 connections per peer (4 upstream), and every pending quote request is answered.
   - ASB: Identify never shares listen addresses, only the configured external addresses.
-  - ASB: The published quote max is 1 % under the balance the wallet can lock.
+  - ASB: The published quote max is 1 % under the balance the wallet can lock. 5.0.4's
+    smallest amount that setup accepts is checked against that lowered max: the quote offers
+    no trade when it is above it.
   - ASB: js-libp2p flood connections are dropped on identify, peers whose swap setup does not
     decode are refused for 10 minutes, and flood lines stay out of the logs.
-  - CLI: New `list-sellers` subcommand (and `buy-xmr` on `port/5.0.3-cli-buyxmr`).
+  - CLI: New `list-sellers` subcommand (and `buy-xmr` on `port/5.0.4-cli-buyxmr`).
   - CI: `build-asb-mutex` builds the ASB image on GHCR for `ci/**` branches,
-    `fork-unit-tests` runs the fork's unit tests.
+    `fork-unit-tests` runs the fork's unit tests. Their actions are pinned to commit SHAs and
+    recorded in `.github/workflows/actions.lock`, as 5.0.4 does for upstream's workflows.
 
 ## [5.0.4] - 2026-11-16
 
